@@ -22,6 +22,10 @@ import (
 // then returns an array of strings indicating what endpoints were started
 // (these are format strings that will expect to be sent a single string value).
 func (c *AssetConfig) InstallAPI(container *restful.Container) []string {
+	if c.WebConsoleDisabled {
+		return []string{fmt.Sprintf("Web Console will not be started.")}
+	}
+
 	assetHandler, err := c.buildHandler()
 	if err != nil {
 		glog.Fatal(err)
@@ -40,6 +44,10 @@ func (c *AssetConfig) InstallAPI(container *restful.Container) []string {
 // Run starts an http server for the static assets listening on the configured
 // bind address
 func (c *AssetConfig) Run() {
+	if c.WebConsoleDisabled {
+		return
+	}
+
 	assetHandler, err := c.buildHandler()
 	if err != nil {
 		glog.Fatal(err)

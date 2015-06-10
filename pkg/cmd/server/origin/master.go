@@ -120,6 +120,20 @@ func (fn APIInstallFunc) InstallAPI(container *restful.Container) []string {
 	return fn(container)
 }
 
+// assetServerOffNotice returns a notice that the web console is off if
+// this feature is disabled.
+func assetServerOffNotice(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// List of paths to show notice on
+		if req.URL.Path == "/login" || req.URL.Path == "/logout" || req.URL.Path == "/console" || strings.HasPrefix(req.URL.Path, "/console/") {
+			w.Write([]byte("You need to upgrade to OpenShift distribution of Kubernetes in order to take advantage of this feature"))
+			return
+		}
+		// Dispatch to the next handler
+		handler.ServeHTTP(w, req)
+	})
+}
+
 // Run launches the OpenShift master. It takes optional installers that may install additional endpoints into the server.
 // All endpoints get configured CORS behavior
 // Protected installers' endpoints are protected by API authentication and authorization.
@@ -170,7 +184,11 @@ func (c *MasterConfig) Run(protected []APIInstaller, unprotected []APIInstaller)
 	}
 
 	if c.Options.AssetConfig != nil {
-		handler = assetServerRedirect(handler, c.Options.AssetConfig.PublicURL)
+		if c.Options.DisabledFeatures.Has(configapi.FeatureWebConsole) {
+			handler = assetServerOffNotice(handler)
+		} else {
+			handler = assetServerRedirect(handler, c.Options.AssetConfig.PublicURL)
+		}
 	}
 
 	// Make the outermost filter the requestContextMapper to ensure all components share the same context

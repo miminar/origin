@@ -23,6 +23,7 @@ import (
 type AuthConfig struct {
 	Options configapi.OAuthConfig
 
+	WebConsoleDisabled bool
 	// AssetPublicAddresses contains valid redirectURI prefixes to direct browsers to the web console
 	AssetPublicAddresses []string
 	MasterRoots          *x509.CertPool
@@ -72,6 +73,7 @@ func BuildAuthConfig(options configapi.MasterConfig) (*AuthConfig, error) {
 	ret := &AuthConfig{
 		Options: *options.OAuthConfig,
 
+		WebConsoleDisabled:   options.DisabledFeatures.Has(configapi.FeatureWebConsole),
 		AssetPublicAddresses: assetPublicURLs,
 		MasterRoots:          apiServerCAs,
 		EtcdHelper:           etcdHelper,
