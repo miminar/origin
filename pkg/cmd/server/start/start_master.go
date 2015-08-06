@@ -69,8 +69,7 @@ You may also pass --kubeconfig=<path> to connect to an external Kubernetes clust
 func NewCommandStartMaster(fullName string, out io.Writer) (*cobra.Command, *MasterOptions) {
 	options := &MasterOptions{Output: out}
 
-	switch fullName {
-	case "atomic-enterprise":
+	if cmdutil.GetProductName() == cmdutil.ProductAtomic {
 		options.DisabledFeatures = configapi.AtomicDisabledFeatures
 	}
 

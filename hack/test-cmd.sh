@@ -95,7 +95,15 @@ fi
 GO_OUT="${OS_ROOT}/_output/local/go/bin"
 export PATH="${GO_OUT}:${PATH}"
 
-ln -svf `readlink -f $(which openshift)` `dirname $(which openshift)`/atomic-enterprise
+# add symlinks pointing to different Kubernetes distributions
+os_bin=`readlink -f $(which openshift)`
+pushd `dirname "$os_bin"`
+    cp -va openshift atomic-enterprise
+    [ -L origin ] && rm origin
+    [ -e origin ] || cp -vaf openshift origin
+    ln -svf "$os_bin" os-link
+    ln -svf `pwd`/atomic-enterprise ae-link
+popd
 
 # Check openshift version
 out=$(openshift version)
@@ -318,12 +326,18 @@ echo "resource-builder: ok"
 [ "$(oadm create-server-cert -h 2>&1 | grep 'Create a key and server certificate')" ]
 [ "$(oadm create-signer-cert -h 2>&1 | grep 'Create a self-signed CA')" ]
 # atomic-enterprise binaries are recognized
-[ "$(openshift | grep -i 'OpenShift Application Platform')" ]
-[ ! "$(openshift | grep -i 'Atomic')" ]
 [ "$(origin | grep -i 'Origin Application Platform')" ]
 [ ! "$(origin | grep -i 'Atomic')" ]
+[ "$(openshift | grep -i 'OpenShift Application Platform')" ]
+[ ! "$(openshift | grep -i 'Atomic')" ]
+[ "$(os-link | grep -i 'OpenShift Application Platform')" ]
+[ ! "$(os-link | grep -i 'Atomic')" ]
 [ "$(atomic-enterprise | grep -i 'Atomic Application Platform')" ]
 [ ! "$(atomic-enterprise | grep -i 'OpenShift')" ]
+[ "$(ae-link | grep -i 'Atomic Application Platform')" ]
+# test chain of symlinks
+ln -svf `which ae-link` ae-link-link
+[ "$(./ae-link-link | grep -i 'Atomic Application Platform')" ]
 
 # help for root commands with --help flag must be consistent
 [ "$(openshift --help 2>&1 | grep 'OpenShift Application Platform')" ]

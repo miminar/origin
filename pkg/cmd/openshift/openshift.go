@@ -92,18 +92,10 @@ func CommandFor(basename string) *cobra.Command {
 func NewCommandOpenShift(name string) *cobra.Command {
 	out := os.Stdout
 
-	product := "Origin"
-	switch name {
-	case "openshift":
-		product = "OpenShift"
-	case "atomic-enterprise":
-		product = "Atomic"
-	}
-
 	root := &cobra.Command{
 		Use:   name,
 		Short: "Build, deploy, and manage your cloud applications",
-		Long:  fmt.Sprintf(openshiftLong, name, product),
+		Long:  fmt.Sprintf(openshiftLong, name, cmdutil.GetProductName()),
 		Run:   cmdutil.DefaultSubCommandRun(out),
 	}
 
