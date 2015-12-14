@@ -1425,6 +1425,10 @@
 		{
 			"ImportPath": "speter.net/go/exp/math/dec/inf",
 			"Rev": "42ca6cd68aa922bc3f32f1e056e61b65945d9ad7"
+		},
+		{
+			"ImportPath": "github.com/Azure/azure-sdk-for-go/storage",
+			"Rev": "178e1bb367957b319f742c83ac06cb3f6c4f44a3"
 		}
 	]
 }
