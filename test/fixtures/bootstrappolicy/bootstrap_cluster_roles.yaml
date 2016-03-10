@@ -867,10 +867,18 @@ items:
     - imagestreammappings
     verbs:
     - create
-  - apiGroups: null
+  - apiGroups:
+    - ""
     attributeRestrictions: null
     resources:
     - resourcequotas
+    verbs:
+    - list
+  - apiGroups:
+    - ""
+    attributeRestrictions: null
+    resources:
+    - limitranges
     verbs:
     - list
 - apiVersion: v1

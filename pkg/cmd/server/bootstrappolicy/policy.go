@@ -461,8 +461,14 @@ func GetBootstrapClusterRoles() []authorizationapi.ClusterRole {
 					Resources: sets.NewString("imagestreammappings"),
 				},
 				{
+					APIGroups: []string{kapi.GroupName},
 					Verbs:     sets.NewString("list"),
 					Resources: sets.NewString("resourcequotas"),
+				},
+				{
+					APIGroups: []string{kapi.GroupName},
+					Verbs:     sets.NewString("list"),
+					Resources: sets.NewString("limitranges"),
 				},
 			},
 		},

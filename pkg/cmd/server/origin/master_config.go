@@ -54,6 +54,7 @@ import (
 	"github.com/openshift/origin/pkg/cmd/util/plug"
 	"github.com/openshift/origin/pkg/cmd/util/pluginconfig"
 	"github.com/openshift/origin/pkg/cmd/util/variable"
+	imageadmission "github.com/openshift/origin/pkg/image/admission"
 	accesstokenregistry "github.com/openshift/origin/pkg/oauth/registry/oauthaccesstoken"
 	accesstokenetcd "github.com/openshift/origin/pkg/oauth/registry/oauthaccesstoken/etcd"
 	projectauth "github.com/openshift/origin/pkg/project/auth"
@@ -177,7 +178,7 @@ func BuildMasterConfig(options configapi.MasterConfig) (*MasterConfig, error) {
 	kubeletClientConfig := configapi.GetKubeletClientConfig(options)
 
 	// in-order list of plug-ins that should intercept admission decisions (origin only intercepts)
-	admissionControlPluginNames := []string{"ProjectRequestLimit", "OriginNamespaceLifecycle", "PodNodeConstraints", "BuildByStrategy", , quotaadmission.PluginName}
+	admissionControlPluginNames := []string{"ProjectRequestLimit", "OriginNamespaceLifecycle", "PodNodeConstraints", "BuildByStrategy", imageadmission.PluginName, quotaadmission.PluginName}
 	if len(options.AdmissionConfig.PluginOrderOverride) > 0 {
 		admissionControlPluginNames = options.AdmissionConfig.PluginOrderOverride
 	}
