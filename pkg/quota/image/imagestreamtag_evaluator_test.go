@@ -318,9 +318,8 @@ func TestImageStreamTagEvaluatorUsage(t *testing.T) {
 		fakeClient.AddReactor("get", "images", getFakeImageGetHandler(t, "ns"))
 		fakeClient.AddReactor("get", "imagestreams", getFakeImageStreamGetHandler(t, tc.iss...))
 		fakeClient.AddReactor("list", "imagestreams", getFakeImageStreamListHandler(t, tc.iss...))
-		fakeClient.AddReactor("get", "imagestreamimages", getFakeImageStreamImageGetHandler(t, tc.iss...))
 
-		evaluator := NewImageStreamTagEvaluator(fakeClient)
+		evaluator := NewImageStreamTagEvaluator(fakeClient, NewImageCache(), NewRegistryAddressCache())
 
 		usage := evaluator.Usage(&tc.ist)
 

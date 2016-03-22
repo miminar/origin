@@ -2,7 +2,6 @@ package image
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 
 	kapi "k8s.io/kubernetes/pkg/api"
@@ -189,9 +188,9 @@ func TestImageStreamEvaluatorUsage(t *testing.T) {
 
 		fakeClient := &testclient.Fake{}
 		fakeClient.AddReactor("get", "imagestreams", getFakeImageStreamGetHandler(t, tc.is))
-		fakeClient.AddReactor("get", "imagestreamimages", getFakeImageStreamImageGetHandler(t, tc.is))
+		fakeClient.AddReactor("get", "images", getFakeImageGetHandler(t, tc.is.Namespace))
 
-		evaluator := NewImageStreamEvaluator(fakeClient)
+		evaluator := NewImageStreamEvaluator(fakeClient, NewImageCache(), NewRegistryAddressCache())
 
 		is, err := evaluator.Get(tc.is.Namespace, tc.is.Name)
 		if err != nil {
@@ -445,9 +444,9 @@ func TestImageStreamEvaluatorUsageStats(t *testing.T) {
 	} {
 		fakeClient := &testclient.Fake{}
 		fakeClient.AddReactor("list", "imagestreams", getFakeImageStreamListHandler(t, tc.iss...))
-		fakeClient.AddReactor("get", "imagestreamimages", getFakeImageStreamImageGetHandler(t, tc.iss...))
+		fakeClient.AddReactor("get", "images", getFakeImageGetHandler(t, tc.namespace))
 
-		evaluator := NewImageStreamEvaluator(fakeClient)
+		evaluator := NewImageStreamEvaluator(fakeClient, NewImageCache(), NewRegistryAddressCache())
 
 		stats, err := evaluator.UsageStats(kquota.UsageStatsOptions{Namespace: tc.namespace})
 		if err != nil {
@@ -855,7 +854,7 @@ func TestImageStreamAdmissionEvaluatorUsage(t *testing.T) {
 		fakeClient.AddReactor("list", "imagestreams", getFakeImageStreamListHandler(t, iss...))
 		fakeClient.AddReactor("get", "images", getFakeImageGetHandler(t, "test"))
 
-		evaluator := NewImageStreamAdmissionEvaluator(fakeClient)
+		evaluator := NewImageStreamAdmissionEvaluator(fakeClient, NewImageCache(), NewRegistryAddressCache())
 
 		usage := evaluator.Usage(newIS)
 
@@ -967,63 +966,6 @@ func getSharedImageStream(namespace, name string) *imageapi.ImageStream {
 	}
 
 	return &sharedIS
-}
-
-func getFakeImageStreamImageGetHandler(t *testing.T, iss ...imageapi.ImageStream) ktestclient.ReactionFunc {
-	sharedIS := getSharedImageStream("shared", "is")
-
-	return func(action ktestclient.Action) (handled bool, ret runtime.Object, err error) {
-		switch a := action.(type) {
-		case ktestclient.GetAction:
-			imageStreams := append([]imageapi.ImageStream{*sharedIS}, iss...)
-			for _, is := range imageStreams {
-				if (a.GetNamespace() != is.Namespace || !strings.HasPrefix(a.GetName(), is.Name+"@")) && (is.Namespace != "shared" || a.GetName() != "shared") {
-					continue
-				}
-				nameParts := strings.SplitN(a.GetName(), "@", 2)
-				name := nameParts[1]
-
-				res := &imageapi.ImageStreamImage{
-					ObjectMeta: kapi.ObjectMeta{
-						Namespace: a.GetNamespace(),
-						Name:      a.GetName(),
-					},
-					Image: imageapi.Image{
-						ObjectMeta: kapi.ObjectMeta{
-							Name:        name,
-							Annotations: map[string]string{imageapi.ManagedByOpenShiftAnnotation: "true"},
-						},
-						DockerImageReference: fmt.Sprintf("registry.example.org/%s/%s", a.GetNamespace(), a.GetName()),
-					},
-				}
-
-				switch name {
-				case baseImageWith1LayerDigest:
-					res.Image.DockerImageManifest = baseImageWith1Layer
-				case baseImageWith2LayersDigest:
-					res.Image.DockerImageManifest = baseImageWith2Layers
-				case childImageWith2LayersDigest:
-					res.Image.DockerImageManifest = childImageWith2Layers
-				case childImageWith3LayersDigest:
-					res.Image.DockerImageManifest = childImageWith3Layers
-				case miscImageDigest:
-					res.Image.DockerImageManifest = miscImage
-				default:
-					err := fmt.Errorf("image %q not found", name)
-					t.Error(err.Error())
-					return true, nil, err
-				}
-
-				t.Logf("imagestreamimage get handler: returning %q", res.Name)
-				return true, res, nil
-			}
-
-			err := fmt.Errorf("imagestreamimage %q not found", a.GetName())
-			t.Error(err.Error())
-			return true, nil, err
-		}
-		return false, nil, nil
-	}
 }
 
 func getFakeImageGetHandler(t *testing.T, namespace string) ktestclient.ReactionFunc {

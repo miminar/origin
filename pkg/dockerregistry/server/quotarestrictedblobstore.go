@@ -55,17 +55,6 @@ type quotaRestrictedBlobStore struct {
 
 var _ distribution.BlobStore = &quotaRestrictedBlobStore{}
 
-func (bs *quotaRestrictedBlobStore) Put(ctx context.Context, mediaType string, p []byte) (distribution.Descriptor, error) {
-	context.GetLogger(ctx).Debug("(*quotaRestrictedBlobStore).Put: starting")
-
-	if err := admitBlobWrite(ctx, bs.repo); err != nil {
-		context.GetLogger(ctx).Error(err.Error())
-		return distribution.Descriptor{}, err
-	}
-
-	return bs.BlobStore.Put(ctx, mediaType, p)
-}
-
 // Create wraps returned blobWriter with quota guard wrapper.
 func (bs *quotaRestrictedBlobStore) Create(ctx context.Context) (distribution.BlobWriter, error) {
 	context.GetLogger(ctx).Debug("(*quotaRestrictedBlobStore).Create: starting")

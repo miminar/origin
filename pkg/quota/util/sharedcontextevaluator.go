@@ -3,15 +3,12 @@ package util
 import (
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/admission"
 	kapi "k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/meta"
 	"k8s.io/kubernetes/pkg/api/resource"
-	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/quota"
 	"k8s.io/kubernetes/pkg/quota/generic"
 	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/sets"
 )
 
 // SharedContextEvaluator provides an implementation for quota.Evaluator
@@ -22,41 +19,18 @@ type SharedContextEvaluator struct {
 
 var _ quota.Evaluator = &SharedContextEvaluator{}
 
-// NewSharedContextEvaluator creates an evaluator object that allows to share context while computing usage of
-// single namespace. Context is represented by an object returned by usageComputerFactory and is destroyed
-// when the namespace is processed.
-func NewSharedContextEvaluator(
-	name string,
-	groupKind unversioned.GroupKind,
-	operationResources map[admission.Operation][]kapi.ResourceName,
-	matchedResourceNames []kapi.ResourceName,
-	matchesScopeFunc generic.MatchesScopeFunc,
-	getFuncByNamespace generic.GetFuncByNamespace,
-	listFuncByNamespace generic.ListFuncByNamespace,
-	constraintsFunc generic.ConstraintsFunc,
-	usageComputerFactory UsageComputerFactory,
-) quota.Evaluator {
-
-	rnSet := sets.String{}
-	for _, resourceNames := range operationResources {
-		rnSet.Insert(quota.ToSet(resourceNames).List()...)
+// NewSharedContextEvaluator wrapes given generic evaluator object so that the resulting evalutor will allow
+// to share context while computing usage of across single project. Context is represented by an object
+// returned by usageComputerFactory and is destroyed when the namespace is processed.
+func NewSharedContextEvaluator(genericEvaluator *generic.GenericEvaluator, usageComputerFactory UsageComputerFactory) quota.Evaluator {
+	eval := *genericEvaluator
+	eval.UsageFunc = func(object runtime.Object) kapi.ResourceList {
+		comp := usageComputerFactory()
+		return comp.Usage(object)
 	}
 
 	return &SharedContextEvaluator{
-		GenericEvaluator: &generic.GenericEvaluator{
-			Name:                       name,
-			InternalGroupKind:          groupKind,
-			InternalOperationResources: operationResources,
-			MatchedResourceNames:       matchedResourceNames,
-			MatchesScopeFunc:           matchesScopeFunc,
-			GetFuncByNamespace:         getFuncByNamespace,
-			ListFuncByNamespace:        listFuncByNamespace,
-			ConstraintsFunc:            constraintsFunc,
-			UsageFunc: func(object runtime.Object) kapi.ResourceList {
-				comp := usageComputerFactory()
-				return comp.Usage(object)
-			},
-		},
+		GenericEvaluator:     &eval,
 		UsageComputerFactory: usageComputerFactory,
 	}
 }

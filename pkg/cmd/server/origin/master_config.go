@@ -58,6 +58,8 @@ import (
 	accesstokenetcd "github.com/openshift/origin/pkg/oauth/registry/oauthaccesstoken/etcd"
 	projectauth "github.com/openshift/origin/pkg/project/auth"
 	projectcache "github.com/openshift/origin/pkg/project/cache"
+	"github.com/openshift/origin/pkg/quota"
+	quotaadmission "github.com/openshift/origin/pkg/quota/admission/resourcequota"
 	"github.com/openshift/origin/pkg/serviceaccounts"
 	usercache "github.com/openshift/origin/pkg/user/cache"
 	groupregistry "github.com/openshift/origin/pkg/user/registry/group"
@@ -175,17 +177,19 @@ func BuildMasterConfig(options configapi.MasterConfig) (*MasterConfig, error) {
 	kubeletClientConfig := configapi.GetKubeletClientConfig(options)
 
 	// in-order list of plug-ins that should intercept admission decisions (origin only intercepts)
-	admissionControlPluginNames := []string{"ProjectRequestLimit", "OriginNamespaceLifecycle", "PodNodeConstraints", "BuildByStrategy", "OriginResourceQuota"}
+	admissionControlPluginNames := []string{"ProjectRequestLimit", "OriginNamespaceLifecycle", "PodNodeConstraints", "BuildByStrategy", , quotaadmission.PluginName}
 	if len(options.AdmissionConfig.PluginOrderOverride) > 0 {
 		admissionControlPluginNames = options.AdmissionConfig.PluginOrderOverride
 	}
 
+	quotaRegistry := quota.NewOriginQuotaRegistry(privilegedLoopbackOpenShiftClient, true)
 	authorizer := newAuthorizer(policyClient, options.ProjectConfig.ProjectRequestMessage)
 
 	pluginInitializer := oadmission.PluginInitializer{
-		OpenshiftClient: privilegedLoopbackOpenShiftClient,
-		ProjectCache:    projectCache,
-		Authorizer:      authorizer,
+		OpenshiftClient:     privilegedLoopbackOpenShiftClient,
+		ProjectCache:        projectCache,
+		OriginQuotaRegistry: quotaRegistry,
+		Authorizer:          authorizer,
 	}
 
 	plugins := []admission.Interface{}
