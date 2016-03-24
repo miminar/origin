@@ -2,10 +2,10 @@ package testutil
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 
 	kapi "k8s.io/kubernetes/pkg/api"
+	kerrors "k8s.io/kubernetes/pkg/api/errors"
 	ktestclient "k8s.io/kubernetes/pkg/client/unversioned/testclient"
 	"k8s.io/kubernetes/pkg/runtime"
 
@@ -50,8 +50,8 @@ func GetFakeImageStreamGetHandler(t *testing.T, iss ...imageapi.ImageStream) kte
 				}
 			}
 
-			err := fmt.Errorf("image stream %s/%s not found", a.GetNamespace(), a.GetName())
-			t.Errorf(err.Error())
+			err := kerrors.NewNotFound(kapi.Resource("imageStreams"), a.GetName())
+			t.Logf("imagestream get handler: %v", err)
 			return true, nil, err
 		}
 		return false, nil, nil
@@ -87,107 +87,6 @@ func GetSharedImageStream(namespace, name string) *imageapi.ImageStream {
 	}
 
 	return &sharedIS
-}
-
-func GetFakeImageStreamImageGetHandler(t *testing.T, namespace string, iss ...imageapi.ImageStream) ktestclient.ReactionFunc {
-	sharedIS := GetSharedImageStream("shared", "is")
-
-	return func(action ktestclient.Action) (handled bool, ret runtime.Object, err error) {
-		switch a := action.(type) {
-		case ktestclient.GetAction:
-			if a.GetNamespace() != namespace && a.GetNamespace() != "shared" && a.GetName() != "shared" {
-				err := fmt.Errorf("namespace %q not found", a.GetNamespace())
-				t.Error(err.Error())
-				return true, nil, err
-			}
-
-			imageStreams := append([]imageapi.ImageStream{*sharedIS}, iss...)
-			for _, is := range imageStreams {
-				if !strings.HasPrefix(a.GetName(), is.Name+"@") && (is.Namespace != "shared" || a.GetName() != "shared") {
-					continue
-				}
-				nameParts := strings.SplitN(a.GetName(), "@", 2)
-				name := nameParts[1]
-
-				res := &imageapi.ImageStreamImage{
-					ObjectMeta: kapi.ObjectMeta{
-						Namespace: a.GetNamespace(),
-						Name:      a.GetName(),
-					},
-					Image: imageapi.Image{
-						ObjectMeta: kapi.ObjectMeta{
-							Name:        name,
-							Annotations: map[string]string{imageapi.ManagedByOpenShiftAnnotation: "true"},
-						},
-						DockerImageReference: fmt.Sprintf("registry.example.org/%s/%s", a.GetNamespace(), a.GetName()),
-					},
-				}
-
-				switch name {
-				case BaseImageWith1LayerDigest:
-					res.Image.DockerImageManifest = BaseImageWith1Layer
-				case BaseImageWith2LayersDigest:
-					res.Image.DockerImageManifest = BaseImageWith2Layers
-				case ChildImageWith2LayersDigest:
-					res.Image.DockerImageManifest = ChildImageWith2Layers
-				case ChildImageWith3LayersDigest:
-					res.Image.DockerImageManifest = ChildImageWith3Layers
-				case MiscImageDigest:
-					res.Image.DockerImageManifest = MiscImage
-				default:
-					err := fmt.Errorf("image %q not found", name)
-					t.Error(err.Error())
-					return true, nil, err
-				}
-
-				t.Logf("imagestreamimage get handler: returning %q", res.Name)
-				return true, res, nil
-			}
-
-			err := fmt.Errorf("imagestreamimage %q not found", a.GetName())
-			t.Error(err.Error())
-			return true, nil, err
-		}
-		return false, nil, nil
-	}
-}
-
-func GetFakeImageGetHandler(t *testing.T, namespace string) ktestclient.ReactionFunc {
-	return func(action ktestclient.Action) (handled bool, ret runtime.Object, err error) {
-		switch a := action.(type) {
-		case ktestclient.GetAction:
-			name := a.GetName()
-
-			res := imageapi.Image{
-				ObjectMeta: kapi.ObjectMeta{
-					Name:        name,
-					Annotations: map[string]string{imageapi.ManagedByOpenShiftAnnotation: "true"},
-				},
-				DockerImageReference: fmt.Sprintf("registry.example.org/%s/%s", namespace, a.GetName()),
-			}
-
-			switch name {
-			case BaseImageWith1LayerDigest:
-				res.DockerImageManifest = BaseImageWith1Layer
-			case BaseImageWith2LayersDigest:
-				res.DockerImageManifest = BaseImageWith2Layers
-			case ChildImageWith2LayersDigest:
-				res.DockerImageManifest = ChildImageWith2Layers
-			case ChildImageWith3LayersDigest:
-				res.DockerImageManifest = ChildImageWith3Layers
-			case MiscImageDigest:
-				res.DockerImageManifest = MiscImage
-			default:
-				err := fmt.Errorf("image %q not found", name)
-				t.Error(err.Error())
-				return true, nil, err
-			}
-
-			t.Logf("images get handler: returning %q", res.Name)
-			return true, &res, nil
-		}
-		return false, nil, nil
-	}
 }
 
 // 1 data layer of 128 B

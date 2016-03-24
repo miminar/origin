@@ -15,7 +15,7 @@ import (
 
 var (
 	expectedResources = []kapi.ResourceName{
-		imageapi.ResourceImages,
+		imageapi.ResourceImageStreamImages,
 	}
 )
 
@@ -92,7 +92,7 @@ func TestImageStreamEvaluatorUsage(t *testing.T) {
 					},
 				},
 			},
-			1, // spec isn't taken into account
+			2,
 		},
 
 		{
@@ -187,9 +187,8 @@ func TestImageStreamEvaluatorUsage(t *testing.T) {
 
 		fakeClient := &testclient.Fake{}
 		fakeClient.AddReactor("get", "imagestreams", imagetest.GetFakeImageStreamGetHandler(t, tc.is))
-		fakeClient.AddReactor("get", "images", imagetest.GetFakeImageGetHandler(t, tc.is.Namespace))
 
-		evaluator := NewImageStreamEvaluator(fakeClient, NewImageCache(), NewRegistryAddressCache())
+		evaluator := NewImageStreamEvaluator(fakeClient)
 
 		is, err := evaluator.Get(tc.is.Namespace, tc.is.Name)
 		if err != nil {
@@ -204,7 +203,7 @@ func TestImageStreamEvaluatorUsage(t *testing.T) {
 
 		masked := kquota.Mask(usage, expectedResources)
 		expectedUsage := kapi.ResourceList{
-			imageapi.ResourceImages: *resource.NewQuantity(tc.expectedImages, resource.DecimalSI),
+			imageapi.ResourceImageStreamImages: *resource.NewQuantity(tc.expectedImages, resource.DecimalSI),
 		}
 
 		if len(masked) != len(expectedResources) {
@@ -443,9 +442,8 @@ func TestImageStreamEvaluatorUsageStats(t *testing.T) {
 	} {
 		fakeClient := &testclient.Fake{}
 		fakeClient.AddReactor("list", "imagestreams", imagetest.GetFakeImageStreamListHandler(t, tc.iss...))
-		fakeClient.AddReactor("get", "images", imagetest.GetFakeImageGetHandler(t, tc.namespace))
 
-		evaluator := NewImageStreamEvaluator(fakeClient, NewImageCache(), NewRegistryAddressCache())
+		evaluator := NewImageStreamEvaluator(fakeClient)
 
 		stats, err := evaluator.UsageStats(kquota.UsageStatsOptions{Namespace: tc.namespace})
 		if err != nil {
@@ -459,7 +457,7 @@ func TestImageStreamEvaluatorUsageStats(t *testing.T) {
 
 		masked := kquota.Mask(stats.Used, expectedResources)
 		expectedUsage := kapi.ResourceList{
-			imageapi.ResourceImages: *resource.NewQuantity(tc.expectedImages, resource.DecimalSI),
+			imageapi.ResourceImageStreamImages: *resource.NewQuantity(tc.expectedImages, resource.DecimalSI),
 		}
 
 		if len(masked) != len(expectedResources) {
@@ -789,7 +787,8 @@ func TestImageStreamAdmissionEvaluatorUsage(t *testing.T) {
 					},
 				},
 			},
-			expectedImages: 0,
+			// we don't attempt to resolve image stream tags
+			expectedImages: 1,
 		},
 	} {
 
@@ -851,9 +850,8 @@ func TestImageStreamAdmissionEvaluatorUsage(t *testing.T) {
 		fakeClient := &testclient.Fake{}
 		fakeClient.AddReactor("get", "imagestreams", imagetest.GetFakeImageStreamGetHandler(t, iss...))
 		fakeClient.AddReactor("list", "imagestreams", imagetest.GetFakeImageStreamListHandler(t, iss...))
-		fakeClient.AddReactor("get", "images", imagetest.GetFakeImageGetHandler(t, "test"))
 
-		evaluator := NewImageStreamAdmissionEvaluator(fakeClient, NewImageCache(), NewRegistryAddressCache())
+		evaluator := NewImageStreamAdmissionEvaluator(fakeClient)
 
 		usage := evaluator.Usage(newIS)
 
@@ -862,7 +860,7 @@ func TestImageStreamAdmissionEvaluatorUsage(t *testing.T) {
 		}
 
 		expectedUsage := kapi.ResourceList{
-			imageapi.ResourceImages: *resource.NewQuantity(tc.expectedImages, resource.DecimalSI),
+			imageapi.ResourceImageStreamImages: *resource.NewQuantity(tc.expectedImages, resource.DecimalSI),
 		}
 
 		masked := kquota.Mask(usage, expectedResources)

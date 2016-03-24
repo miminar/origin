@@ -4,51 +4,39 @@ import (
 	"fmt"
 
 	"github.com/golang/glog"
-	"github.com/hashicorp/golang-lru"
 
 	kapi "k8s.io/kubernetes/pkg/api"
-	kerrors "k8s.io/kubernetes/pkg/api/errors"
 	"k8s.io/kubernetes/pkg/api/resource"
 	"k8s.io/kubernetes/pkg/client/cache"
-	ktypes "k8s.io/kubernetes/pkg/types"
-	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
 	"k8s.io/kubernetes/pkg/util/sets"
 
 	osclient "github.com/openshift/origin/pkg/client"
 	imageapi "github.com/openshift/origin/pkg/image/api"
 )
 
-// ImageByName maps a name to a corresponding image object
-type ImageByName map[string]*imageapi.Image
-
-// GenericImageStreamUsageComputer allows to compute number of images stored
-// in an internal registry in particular namespace.
+// GenericImageStreamUsageComputer allows to compute number of images stored in an internal registry in
+// particular namespace.
 type GenericImageStreamUsageComputer struct {
 	osClient osclient.Interface
 	// says whether to account for images stored in image stream's spec
 	processSpec bool
-	// maps image name to an image object. It holds only images stored in the registry to avoid multiple
-	// fetches of the same object.
-	imageCache cache.Store
-	// maps image stream name prefixed by its namespace to the image stream object
-	imageStreamCache cache.Store
-	// is a cache of addresses referencing internal docker registry
-	registryAddresses *lru.Cache
 }
 
-// InternalImageHandler is a function passed to the computer when processing images that allows the caller to
-// perform actions on internally managed images. The handler is called on unique image just once.
-type InternalImageHandler func(image *imageapi.Image) error
+// InternalImageReferenceHandler is a function passed to the computer when processing images that allows the
+// caller to perform actions on image references. The handler is called on unique image just once. The
+// reference can either be:
+//
+//  1. an image ID if available (e.g. sha256:2643199e5ed5047eeed22da854748ed88b3a63ba0497601ba75852f7b92d4640)
+//  2. a docker image reference if available (e.g. 172.30.12.34:5000/test/is2:latest
+//  3. an image stream tag (e.g. project/isname:latest)
+type InternalImageReferenceHandler func(imageReference string) error
 
 // NewGenericImageStreamUsageComputer returns an instance of GenericImageStreamUsageComputer.
 // Returned object can be used just once and must be thrown away afterwards.
-func NewGenericImageStreamUsageComputer(osClient osclient.Interface, processSpec bool, imageCache cache.Store, registryAddresses *lru.Cache) *GenericImageStreamUsageComputer {
+func NewGenericImageStreamUsageComputer(osClient osclient.Interface, processSpec bool) *GenericImageStreamUsageComputer {
 	return &GenericImageStreamUsageComputer{
-		osClient:          osClient,
-		processSpec:       processSpec,
-		imageCache:        imageCache,
-		imageStreamCache:  cache.NewStore(cache.MetaNamespaceKeyFunc),
-		registryAddresses: registryAddresses,
+		osClient:    osClient,
+		processSpec: processSpec,
 	}
 }
 
@@ -60,11 +48,11 @@ func (c *GenericImageStreamUsageComputer) GetImageStreamUsage(
 ) *resource.Quantity {
 	images := resource.NewQuantity(0, resource.DecimalSI)
 
-	c.ProcessImageStreamImages(is, func(img *imageapi.Image) error {
-		if processedImages.Has(img.Name) {
+	c.ProcessImageStreamImages(is, func(ref string) error {
+		if processedImages.Has(ref) {
 			return nil
 		}
-		processedImages.Insert(img.Name)
+		processedImages.Insert(ref)
 		images.Set(images.Value() + 1)
 		return nil
 	})
@@ -76,7 +64,7 @@ func (c *GenericImageStreamUsageComputer) GetImageStreamUsage(
 func (c *GenericImageStreamUsageComputer) GetProjectImagesUsage(namespace string) (*resource.Quantity, error) {
 	processedImages := sets.NewString()
 
-	iss, err := c.listImageStreams(namespace)
+	iss, err := c.osClient.ImageStreams(namespace).List(kapi.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -84,9 +72,9 @@ func (c *GenericImageStreamUsageComputer) GetProjectImagesUsage(namespace string
 	images := resource.NewQuantity(0, resource.DecimalSI)
 
 	for _, is := range iss.Items {
-		c.ProcessImageStreamImages(&is, func(img *imageapi.Image) error {
-			if !processedImages.Has(img.Name) {
-				processedImages.Insert(img.Name)
+		c.ProcessImageStreamImages(&is, func(ref string) error {
+			if !processedImages.Has(ref) {
+				processedImages.Insert(ref)
 				images.Set(images.Value() + 1)
 			}
 			return nil
@@ -106,11 +94,11 @@ func (c *GenericImageStreamUsageComputer) GetProjectImagesUsage(namespace string
 func (c *GenericImageStreamUsageComputer) GetProjectImagesUsageIncrement(
 	namespace string,
 	is *imageapi.ImageStream,
-	image *imageapi.Image,
+	imageReference string,
 ) (images, imagesIncrement *resource.Quantity, err error) {
 	processedImages := sets.NewString()
 
-	iss, err := c.listImageStreams(namespace)
+	iss, err := c.osClient.ImageStreams(namespace).List(kapi.ListOptions{})
 	if err != nil {
 		return
 	}
@@ -121,25 +109,26 @@ func (c *GenericImageStreamUsageComputer) GetProjectImagesUsageIncrement(
 		if is != nil && imageStream.Name == is.Name {
 			continue
 		}
-		c.ProcessImageStreamImages(&imageStream, func(img *imageapi.Image) error {
-			processedImages.Insert(img.Name)
+		c.ProcessImageStreamImages(&imageStream, func(ref string) error {
+			processedImages.Insert(ref)
 			return nil
 		})
 	}
 
 	if is != nil {
-		c.ProcessImageStreamImages(is, func(img *imageapi.Image) error {
-			if !processedImages.Has(img.Name) {
-				processedImages.Insert(img.Name)
+		c.ProcessImageStreamImages(is, func(ref string) error {
+			if !processedImages.Has(ref) {
+				processedImages.Insert(ref)
 				imagesIncrement.Set(imagesIncrement.Value() + 1)
 			}
 			return nil
 		})
 	}
 
-	if image != nil && !processedImages.Has(image.Name) {
-		if value, ok := image.Annotations[imageapi.ManagedByOpenShiftAnnotation]; ok && value == "true" {
-			if !processedImages.Has(image.Name) {
+	if len(imageReference) != 0 && !processedImages.Has(imageReference) {
+		if !processedImages.Has(imageReference) {
+			ref, parseErr := imageapi.ParseDockerImageReference(imageReference)
+			if parseErr != nil || len(ref.ID) == 0 || !processedImages.Has(ref.ID) {
 				imagesIncrement.Set(imagesIncrement.Value() + 1)
 			}
 		}
@@ -152,18 +141,18 @@ func (c *GenericImageStreamUsageComputer) GetProjectImagesUsageIncrement(
 
 // ProcessImageStreamImages is a utility method that calls a given handler for every image of the given image
 // stream that belongs to internal registry. It process image stream status and optionally spec.
-func (c *GenericImageStreamUsageComputer) ProcessImageStreamImages(is *imageapi.ImageStream, handler InternalImageHandler) error {
-	imageByName := c.gatherImagesFromImageStreamStatus(is)
+func (c *GenericImageStreamUsageComputer) ProcessImageStreamImages(is *imageapi.ImageStream, handler InternalImageReferenceHandler) error {
+	imageReferences := c.gatherImagesFromImageStreamStatus(is)
 
 	if c.processSpec {
-		specImageMap := c.gatherImagesFromImageStreamSpec(is)
-		for k, v := range specImageMap {
-			imageByName[k] = v
+		specReferences := c.gatherImagesFromImageStreamSpec(is)
+		for k, v := range specReferences {
+			imageReferences[k] = v
 		}
 	}
 
-	for _, image := range imageByName {
-		if err := handler(image); err != nil {
+	for ref := range imageReferences {
+		if err := handler(ref); err != nil {
 			return err
 		}
 	}
@@ -172,32 +161,17 @@ func (c *GenericImageStreamUsageComputer) ProcessImageStreamImages(is *imageapi.
 
 // gatherImagesFromImageStreamStatus is a utility method that collects all internally managed images found in
 // a status of the given image stream
-func (c *GenericImageStreamUsageComputer) gatherImagesFromImageStreamStatus(is *imageapi.ImageStream) ImageByName {
-	res := make(ImageByName)
+func (c *GenericImageStreamUsageComputer) gatherImagesFromImageStreamStatus(is *imageapi.ImageStream) sets.String {
+	res := sets.NewString()
 
 	for _, history := range is.Status.Tags {
 		for i := range history.Items {
-			imageName := history.Items[i].Image
-			if len(history.Items[i].DockerImageReference) == 0 || len(imageName) == 0 {
-				continue
+			ref := history.Items[i].Image
+			if len(ref) == 0 {
+				ref = history.Items[i].DockerImageReference
 			}
 
-			img, err := c.GetImage(imageName)
-			if err != nil {
-				if !kerrors.IsNotFound(err) {
-					utilruntime.HandleError(fmt.Errorf("failed to get image %s: %v", imageName, err))
-				}
-				continue
-			}
-
-			if value, ok := img.Annotations[imageapi.ManagedByOpenShiftAnnotation]; !ok || value != "true" {
-				glog.V(5).Infof("image %q with DockerImageReference %q belongs to an external registry - skipping", img.Name, img.DockerImageReference)
-				continue
-			}
-
-			c.cacheInternalRegistryName(img.DockerImageReference)
-
-			res[img.Name] = img
+			res.Insert(ref)
 		}
 	}
 
@@ -206,10 +180,10 @@ func (c *GenericImageStreamUsageComputer) gatherImagesFromImageStreamStatus(is *
 
 // gatherImagesFromImageStreamSpec is a utility method that collects all internally managed images found in a
 // spec of the given image stream
-func (c *GenericImageStreamUsageComputer) gatherImagesFromImageStreamSpec(is *imageapi.ImageStream) ImageByName {
-	res := make(ImageByName)
+func (c *GenericImageStreamUsageComputer) gatherImagesFromImageStreamSpec(is *imageapi.ImageStream) sets.String {
+	res := sets.NewString()
 
-	for tag, tagRef := range is.Spec.Tags {
+	for _, tagRef := range is.Spec.Tags {
 		if tagRef.From == nil {
 			continue
 		}
@@ -220,62 +194,23 @@ func (c *GenericImageStreamUsageComputer) gatherImagesFromImageStreamSpec(is *im
 			continue
 		}
 
-		var img *imageapi.Image
-
-		imageObject, exists, err := c.imageCache.GetByKey(ref.ID)
-		if err != nil {
-			utilruntime.HandleError(fmt.Errorf("failed to lookup image by id %s: %v", ref.ID, err))
-			continue
-		}
-		img, isAnImage := imageObject.(*imageapi.Image)
-		if !exists || !isAnImage {
-			imageID := ref.ID
-			if len(imageID) == 0 {
-				tag = ref.Tag
-				if len(tag) == 0 {
-					tag = imageapi.DefaultImageTag
-				}
-				event := imageapi.LatestTaggedImage(is, tag)
-				if event == nil || len(event.Image) == 0 {
-					glog.V(4).Infof("failed to resolve istag %s", imageapi.JoinImageStreamTag(is.Name, tag))
-					continue
-				}
-				imageID = event.Image
-			}
-
-			img, err = c.GetImage(ref.ID)
-			if err != nil {
-				if !kerrors.IsNotFound(err) {
-					utilruntime.HandleError(fmt.Errorf("failed to get image %s: %v", ref.ID, err))
-				}
-				continue
-			}
-		}
-
-		if value, ok := img.Annotations[imageapi.ManagedByOpenShiftAnnotation]; !ok || value != "true" {
-			glog.V(4).Infof("image %q with DockerImageReference %q belongs to an external registry - skipping", img.Name, img.DockerImageReference)
-			continue
-		}
-
-		c.cacheInternalRegistryName(img.DockerImageReference)
-
-		res[img.Name] = img
+		res.Insert(ref)
 	}
 
 	return res
 }
 
-// GetImageReferenceForObjectReference returns corresponding docker image reference for the given object
+// GetImageReferenceForObjectReference returns corresponding image reference for the given object
 // reference representing either an image stream image or image stream tag or docker image.
 func (c *GenericImageStreamUsageComputer) GetImageReferenceForObjectReference(
 	namespace string,
 	objRef *kapi.ObjectReference,
-) (imageapi.DockerImageReference, error) {
+) (string, error) {
 	switch objRef.Kind {
-	case "ImageStreamImage":
+	case "ImageStreamImage", "DockerImage":
 		res, err := imageapi.ParseDockerImageReference(objRef.Name)
 		if err != nil {
-			return imageapi.DockerImageReference{}, err
+			return "", err
 		}
 		if res.Namespace == "" {
 			res.Namespace = objRef.Namespace
@@ -283,15 +218,18 @@ func (c *GenericImageStreamUsageComputer) GetImageReferenceForObjectReference(
 		if res.Namespace == "" {
 			res.Namespace = namespace
 		}
-		return res, nil
+
+		if len(res.ID) != 0 {
+			return res.ID, nil
+		}
+
+		// docker image reference
+		return res.Exact(), nil
 
 	case "ImageStreamTag":
-		// This is really fishy. An admission check can be easily worked around by setting a tag reference
-		// to an ImageStreamTag with no or small image and then tagging a large image to the source tag.
-		// TODO: Shall we refuse an ImageStreamTag set in the spec if the quota is set?
 		isName, tag, err := imageapi.ParseImageStreamTagName(objRef.Name)
 		if err != nil {
-			return imageapi.DockerImageReference{}, err
+			return "", err
 		}
 
 		ns := namespace
@@ -299,91 +237,12 @@ func (c *GenericImageStreamUsageComputer) GetImageReferenceForObjectReference(
 			ns = objRef.Namespace
 		}
 
-		is, err := c.getImageStream(ns, isName)
-		if err != nil {
-			return imageapi.DockerImageReference{}, fmt.Errorf("failed to get imageStream for ImageStreamTag %s/%s: %v", ns, objRef.Name, err)
-		}
-
-		event := imageapi.LatestTaggedImage(is, tag)
-		if event == nil || len(event.DockerImageReference) == 0 {
-			return imageapi.DockerImageReference{}, fmt.Errorf("%q is not currently pointing to an image, cannot use it as the source of a tag", objRef.Name)
-		}
-		return imageapi.ParseDockerImageReference(event.DockerImageReference)
-
-	case "DockerImage":
-		managedByOS, ref := c.imageReferenceBelongsToInternalRegistry(objRef.Name)
-		if !managedByOS {
-			return imageapi.DockerImageReference{}, fmt.Errorf("DockerImage %s does not belong to internal registry", objRef.Name)
-		}
-		return ref, nil
+		// <namespace>/<isname>:<tag>
+		return cache.MetaNamespaceKeyFunc(&kapi.ObjectMeta{
+			Namespace: ns,
+			Name:      imageapi.JoinImageStreamTag(isName, tag),
+		})
 	}
 
-	return imageapi.DockerImageReference{}, fmt.Errorf("unsupported object reference kind %s", objRef.Kind)
-}
-
-// getImageStream gets an image stream object from etcd and caches the result for the following queries.
-func (c *GenericImageStreamUsageComputer) getImageStream(namespace, name string) (*imageapi.ImageStream, error) {
-	isObject, exists, _ := c.imageStreamCache.GetByKey(ktypes.NamespacedName{
-		Namespace: namespace,
-		Name:      name,
-	}.String())
-	if exists {
-		converted, ok := isObject.(*imageapi.ImageStream)
-		if !ok {
-			return nil, fmt.Errorf("unexpected object %T stored in imageStreamCache", isObject)
-		}
-		return converted, nil
-	}
-	is, err := c.osClient.ImageStreams(namespace).Get(name)
-	if err == nil {
-		c.imageStreamCache.Add(is)
-	}
-	return is, err
-}
-
-// GetImage gets image object from etcd and caches the result for the following queries.
-func (c *GenericImageStreamUsageComputer) GetImage(name string) (*imageapi.Image, error) {
-	imageObject, exists, _ := c.imageCache.GetByKey(name)
-	if exists {
-		converted, ok := imageObject.(*imageapi.Image)
-		if !ok {
-			return nil, fmt.Errorf("unexpected object %T stored in imageCache", imageObject)
-		}
-		return converted, nil
-	}
-	image, err := c.osClient.Images().Get(name)
-	if err == nil {
-		c.imageCache.Add(image)
-	}
-	return image, err
-}
-
-// listImageStreams returns a list of image streams of the given namespace and caches them for later access.
-func (c *GenericImageStreamUsageComputer) listImageStreams(namespace string) (*imageapi.ImageStreamList, error) {
-	iss, err := c.osClient.ImageStreams(namespace).List(kapi.ListOptions{})
-	if err == nil {
-		for _, is := range iss.Items {
-			c.imageStreamCache.Add(&is)
-		}
-	}
-	return iss, err
-}
-
-// cacheInternalRegistryName caches registry name of the given docker image reference of an image stored in an
-// internal registry.
-func (c *GenericImageStreamUsageComputer) cacheInternalRegistryName(dockerImageReference string) {
-	ref, err := imageapi.ParseDockerImageReference(dockerImageReference)
-	if err == nil && len(ref.Registry) > 0 {
-		c.registryAddresses.Add(ref.Registry, struct{}{})
-	}
-}
-
-// imageReferenceBelongsToInternalRegistry returns true if the given docker image reference refers to an
-// image in an internal registry.
-func (c *GenericImageStreamUsageComputer) imageReferenceBelongsToInternalRegistry(dockerImageReference string) (bool, imageapi.DockerImageReference) {
-	ref, err := imageapi.ParseDockerImageReference(dockerImageReference)
-	if err != nil || len(ref.Registry) == 0 || len(ref.Namespace) == 0 || len(ref.Name) == 0 {
-		return false, ref
-	}
-	return c.registryAddresses.Contains(ref.Registry), ref
+	return "", fmt.Errorf("unsupported object reference kind %s", objRef.Kind)
 }

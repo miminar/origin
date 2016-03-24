@@ -3,12 +3,9 @@ package image
 import (
 	"fmt"
 
-	lru "github.com/hashicorp/golang-lru"
-
 	"k8s.io/kubernetes/pkg/admission"
 	kapi "k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/resource"
-	"k8s.io/kubernetes/pkg/client/cache"
 	kquota "k8s.io/kubernetes/pkg/quota"
 	"k8s.io/kubernetes/pkg/quota/generic"
 	"k8s.io/kubernetes/pkg/runtime"
@@ -27,12 +24,12 @@ const (
 
 // NewImageStreamEvaluator computes resource usage of ImageStreams. Instantiating this is necessary for
 // resource quota admission controller to properly work on image stream related objects.
-func NewImageStreamEvaluator(osClient osclient.Interface, imageCache cache.Store, registryAddresses *lru.Cache) kquota.Evaluator {
+func NewImageStreamEvaluator(osClient osclient.Interface) kquota.Evaluator {
 	listFuncByNamespace := func(namespace string, options kapi.ListOptions) (runtime.Object, error) {
 		return osClient.ImageStreams(namespace).List(options)
 	}
 
-	evaluator := NewImageStreamAdmissionEvaluator(osClient, imageCache, registryAddresses)
+	evaluator := NewImageStreamAdmissionEvaluator(osClient)
 	genericEvaluator := evaluator.(*generic.GenericEvaluator)
 	genericEvaluator.Name = imageStreamEvaluatorName
 	// This evaluator isn't meant to be used for admission. Therefore let's clear supported admission
@@ -44,14 +41,14 @@ func NewImageStreamEvaluator(osClient osclient.Interface, imageCache cache.Store
 
 	return quotautil.NewSharedContextEvaluator(
 		genericEvaluator,
-		makeImageStreamUsageComputerFactory(osClient, imageCache, registryAddresses))
+		makeImageStreamUsageComputerFactory(osClient))
 }
 
 // NewImageStreamAdmissionEvaluator computes resource usage of ImageStreams in the context of admission
 // plugin.
-func NewImageStreamAdmissionEvaluator(osClient osclient.Interface, imageCache cache.Store, registryAddresses *lru.Cache) kquota.Evaluator {
+func NewImageStreamAdmissionEvaluator(osClient osclient.Interface) kquota.Evaluator {
 	computeResources := []kapi.ResourceName{
-		imageapi.ResourceImages,
+		imageapi.ResourceImageStreamImages,
 	}
 
 	matchesScopeFunc := func(kapi.ResourceQuotaScope, runtime.Object) bool { return true }
@@ -68,7 +65,7 @@ func NewImageStreamAdmissionEvaluator(osClient osclient.Interface, imageCache ca
 		},
 		MatchedResourceNames: computeResources,
 		MatchesScopeFunc:     matchesScopeFunc,
-		UsageFunc:            makeImageStreamAdmissionUsageFunc(osClient, imageCache, registryAddresses),
+		UsageFunc:            makeImageStreamAdmissionUsageFunc(osClient),
 		GetFuncByNamespace:   getFuncByNamespace,
 		ConstraintsFunc:      imageStreamConstraintsFunc,
 	}
@@ -84,10 +81,10 @@ func imageStreamConstraintsFunc(required []kapi.ResourceName, object runtime.Obj
 
 // makeImageStreamUsageComputerFactory returns an object used during computation of image quota across all
 // repositories in a namespace.
-func makeImageStreamUsageComputerFactory(osClient osclient.Interface, imageCache cache.Store, registryAddresses *lru.Cache) quotautil.UsageComputerFactory {
+func makeImageStreamUsageComputerFactory(osClient osclient.Interface) quotautil.UsageComputerFactory {
 	return func() quotautil.UsageComputer {
 		return &imageStreamUsageComputer{
-			GenericImageStreamUsageComputer: *NewGenericImageStreamUsageComputer(osClient, false, imageCache, registryAddresses),
+			GenericImageStreamUsageComputer: *NewGenericImageStreamUsageComputer(osClient, true),
 			processedImages:                 sets.NewString(),
 		}
 	}
@@ -108,28 +105,28 @@ func (c *imageStreamUsageComputer) Usage(object runtime.Object) kapi.ResourceLis
 
 	images := c.GetImageStreamUsage(is, c.processedImages)
 	return kapi.ResourceList{
-		imageapi.ResourceImages: *images,
+		imageapi.ResourceImageStreamImages: *images,
 	}
 }
 
 // makeImageStreamAdmissionUsageFunc retuns a function for computing a usage of an image stream.
-func makeImageStreamAdmissionUsageFunc(osClient osclient.Interface, imageCache cache.Store, registryAddresses *lru.Cache) generic.UsageFunc {
+func makeImageStreamAdmissionUsageFunc(osClient osclient.Interface) generic.UsageFunc {
 	return func(object runtime.Object) kapi.ResourceList {
 		is, ok := object.(*imageapi.ImageStream)
 		if !ok {
 			return kapi.ResourceList{}
 		}
 
-		c := NewGenericImageStreamUsageComputer(osClient, true, imageCache, registryAddresses)
+		c := NewGenericImageStreamUsageComputer(osClient, true)
 
-		_, imagesIncrement, err := c.GetProjectImagesUsageIncrement(is.Namespace, is, nil)
+		_, imagesIncrement, err := c.GetProjectImagesUsageIncrement(is.Namespace, is, "")
 		if err != nil {
 			utilruntime.HandleError(fmt.Errorf("failed to compute project images usage increment in namespace %q: %v", is.Namespace, err))
 			return kapi.ResourceList{}
 		}
 
 		return map[kapi.ResourceName]resource.Quantity{
-			imageapi.ResourceImages: *imagesIncrement,
+			imageapi.ResourceImageStreamImages: *imagesIncrement,
 		}
 	}
 }

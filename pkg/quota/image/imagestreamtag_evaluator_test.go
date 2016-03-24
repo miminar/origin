@@ -278,6 +278,18 @@ func TestImageStreamTagEvaluatorUsage(t *testing.T) {
 						Namespace: "test",
 						Name:      "destis",
 					},
+					Spec: imageapi.ImageStreamSpec{
+						Tags: map[string]imageapi.TagReference{
+							"new": {
+								Name: "new",
+								From: &kapi.ObjectReference{
+									Kind:      "ImageStreamTag",
+									Namespace: "shared",
+									Name:      "is:latest",
+								},
+							},
+						},
+					},
 					Status: imageapi.ImageStreamStatus{
 						Tags: map[string]imageapi.TagEventList{
 							"latest": {
@@ -316,16 +328,14 @@ func TestImageStreamTagEvaluatorUsage(t *testing.T) {
 	} {
 
 		fakeClient := &testclient.Fake{}
-		fakeClient.AddReactor("get", "images", imagetest.GetFakeImageGetHandler(t, "ns"))
-		fakeClient.AddReactor("get", "imagestreams", imagetest.GetFakeImageStreamGetHandler(t, tc.iss...))
 		fakeClient.AddReactor("list", "imagestreams", imagetest.GetFakeImageStreamListHandler(t, tc.iss...))
 
-		evaluator := NewImageStreamTagEvaluator(fakeClient, NewImageCache(), NewRegistryAddressCache())
+		evaluator := NewImageStreamTagEvaluator(fakeClient)
 
 		usage := evaluator.Usage(&tc.ist)
 
 		expectedUsage := kapi.ResourceList{
-			imageapi.ResourceImages: *resource.NewQuantity(tc.expectedImages, resource.DecimalSI),
+			imageapi.ResourceImageStreamImages: *resource.NewQuantity(tc.expectedImages, resource.DecimalSI),
 		}
 
 		if len(usage) != len(expectedUsage) {

@@ -50,7 +50,8 @@ func TestImageStreamMappingEvaluatorUsage(t *testing.T) {
 			imageAnnotations: map[string]string{imageapi.ManagedByOpenShiftAnnotation: "true"},
 			destISNamespace:  "test",
 			destISName:       "is",
-			expectedImages:   1,
+			// there must be no increment if the image stream doesn't already exist
+			expectedRefs: 0,
 		},
 
 		{
@@ -68,7 +69,8 @@ func TestImageStreamMappingEvaluatorUsage(t *testing.T) {
 			imageManifest:   imagetest.MiscImage,
 			destISNamespace: "test",
 			destISName:      "is",
-			expectedImages:  0,
+			// we don't differentiate between internal and external references
+			expectedImages: 1,
 		},
 
 		{
@@ -154,7 +156,7 @@ func TestImageStreamMappingEvaluatorUsage(t *testing.T) {
 		},
 
 		{
-			name: "add a new tag to a new image stream with image present in the other",
+			name: "add a new tag to an image stream with image present in the other",
 			iss: []imageapi.ImageStream{
 				{
 					ObjectMeta: kapi.ObjectMeta{
@@ -174,6 +176,12 @@ func TestImageStreamMappingEvaluatorUsage(t *testing.T) {
 						},
 					},
 				},
+				{
+					ObjectMeta: kapi.ObjectMeta{
+						Namespace: "test",
+						Name:      "destis",
+					},
+				},
 			},
 			imageName:        imagetest.BaseImageWith2LayersDigest,
 			imageManifest:    imagetest.BaseImageWith2Layers,
@@ -186,9 +194,9 @@ func TestImageStreamMappingEvaluatorUsage(t *testing.T) {
 
 		fakeClient := &testclient.Fake{}
 		fakeClient.AddReactor("list", "imagestreams", imagetest.GetFakeImageStreamListHandler(t, tc.iss...))
-		fakeClient.AddReactor("get", "images", imagetest.GetFakeImageGetHandler(t, tc.destISNamespace))
+		fakeClient.AddReactor("get", "imagestreams", imagetest.GetFakeImageStreamGetHandler(t, tc.iss...))
 
-		evaluator := NewImageStreamMappingEvaluator(fakeClient, NewImageCache(), NewRegistryAddressCache())
+		evaluator := NewImageStreamMappingEvaluator(fakeClient)
 
 		ism := &imageapi.ImageStreamMapping{
 			ObjectMeta: kapi.ObjectMeta{
@@ -213,7 +221,7 @@ func TestImageStreamMappingEvaluatorUsage(t *testing.T) {
 
 		masked := kquota.Mask(usage, expectedResources)
 		expectedUsage := kapi.ResourceList{
-			imageapi.ResourceImages: *resource.NewQuantity(tc.expectedImages, resource.DecimalSI),
+			imageapi.ResourceImageStreamImages: *resource.NewQuantity(tc.expectedImages, resource.DecimalSI),
 		}
 
 		if len(masked) != len(expectedUsage) {

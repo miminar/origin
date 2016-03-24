@@ -4,13 +4,11 @@ import (
 	"fmt"
 
 	"github.com/golang/glog"
-	"github.com/hashicorp/golang-lru"
 
 	"k8s.io/kubernetes/pkg/admission"
 	kapi "k8s.io/kubernetes/pkg/api"
 	kerrors "k8s.io/kubernetes/pkg/api/errors"
 	"k8s.io/kubernetes/pkg/api/resource"
-	"k8s.io/kubernetes/pkg/client/cache"
 	kquota "k8s.io/kubernetes/pkg/quota"
 	"k8s.io/kubernetes/pkg/quota/generic"
 	"k8s.io/kubernetes/pkg/runtime"
@@ -24,9 +22,9 @@ const imageStreamTagEvaluatorName = "Evaluator.ImageStreamTag"
 
 // NewImageStreamTagEvaluator computes resource usage of ImageStreamsTags. Its sole purpose is to handle
 // UPDATE admission operations on imageStreamTags resource.
-func NewImageStreamTagEvaluator(osClient osclient.Interface, imageCache cache.Store, registryAddresses *lru.Cache) kquota.Evaluator {
+func NewImageStreamTagEvaluator(osClient osclient.Interface) kquota.Evaluator {
 	computeResources := []kapi.ResourceName{
-		imageapi.ResourceImages,
+		imageapi.ResourceImageStreamImages,
 	}
 
 	matchesScopeFunc := func(kapi.ResourceQuotaScope, runtime.Object) bool { return true }
@@ -57,7 +55,7 @@ func NewImageStreamTagEvaluator(osClient osclient.Interface, imageCache cache.St
 		InternalOperationResources: map[admission.Operation][]kapi.ResourceName{admission.Update: computeResources},
 		MatchedResourceNames:       computeResources,
 		MatchesScopeFunc:           matchesScopeFunc,
-		UsageFunc:                  makeImageStreamTagAdmissionUsageFunc(osClient, imageCache, registryAddresses),
+		UsageFunc:                  makeImageStreamTagAdmissionUsageFunc(osClient),
 		GetFuncByNamespace:         getFuncByNamespace,
 		ConstraintsFunc:            imageStreamTagConstraintsFunc,
 	}
@@ -73,7 +71,7 @@ func imageStreamTagConstraintsFunc(required []kapi.ResourceName, object runtime.
 
 // makeImageStreamTagAdmissionUsageFunc returns a function that computes a resource usage for given image
 // stream tag during admission.
-func makeImageStreamTagAdmissionUsageFunc(osClient osclient.Interface, imageCache cache.Store, registryAddresses *lru.Cache) generic.UsageFunc {
+func makeImageStreamTagAdmissionUsageFunc(osClient osclient.Interface) generic.UsageFunc {
 	return func(object runtime.Object) kapi.ResourceList {
 		ist, ok := object.(*imageapi.ImageStreamTag)
 		if !ok {
@@ -81,7 +79,7 @@ func makeImageStreamTagAdmissionUsageFunc(osClient osclient.Interface, imageCach
 		}
 
 		res := map[kapi.ResourceName]resource.Quantity{
-			imageapi.ResourceImages: *resource.NewQuantity(0, resource.BinarySI),
+			imageapi.ResourceImageStreamImages: *resource.NewQuantity(0, resource.BinarySI),
 		}
 
 		if ist.Tag == nil {
@@ -100,7 +98,7 @@ func makeImageStreamTagAdmissionUsageFunc(osClient osclient.Interface, imageCach
 			return res
 		}
 
-		c := NewGenericImageStreamUsageComputer(osClient, false, imageCache, registryAddresses)
+		c := NewGenericImageStreamUsageComputer(osClient, true)
 
 		ref, err := c.GetImageReferenceForObjectReference(ist.Namespace, ist.Tag.From)
 		if err != nil {
@@ -108,21 +106,13 @@ func makeImageStreamTagAdmissionUsageFunc(osClient osclient.Interface, imageCach
 			return res
 		}
 
-		img, err := c.GetImage(ref.ID)
+		_, imagesIncrement, err := c.GetProjectImagesUsageIncrement(ist.Namespace, nil, ref)
 		if err != nil {
-			if !kerrors.IsNotFound(err) {
-				utilruntime.HandleError(fmt.Errorf("failed to get an image %s: %v", ref.ID, err))
-			}
+			utilruntime.HandleError(fmt.Errorf("failed to get namespace usage increment of %q with an image reference %q: %v", ist.Namespace, ref, err))
 			return res
 		}
 
-		_, imagesIncrement, err := c.GetProjectImagesUsageIncrement(ist.Namespace, nil, img)
-		if err != nil {
-			utilruntime.HandleError(fmt.Errorf("failed to get namespace usage increment of %q with an image %q: %v", ist.Namespace, img.Name, err))
-			return res
-		}
-
-		res[imageapi.ResourceImages] = *imagesIncrement
+		res[imageapi.ResourceImageStreamImages] = *imagesIncrement
 
 		return res
 	}

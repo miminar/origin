@@ -165,8 +165,10 @@ func admitQuotas(ctx context.Context, repo *repository) error {
 	}
 
 	usage := kapi.ResourceList{
-		// we are about to tag a single image to an image stream
-		imageapi.ResourceImages: *resource.NewQuantity(1, resource.DecimalSI),
+		// We're just checking whether we won't end up over the quota limit on image stream images. We don't
+		// increment the usage here. It will be incremented during a creation of ImageStreamMapping caused by
+		// manifest put.
+		imageapi.ResourceImageStreamImages: *resource.NewQuantity(1, resource.DecimalSI),
 	}
 	resources := quota.ResourceNames(usage)
 
