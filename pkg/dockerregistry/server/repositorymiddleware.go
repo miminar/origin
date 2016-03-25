@@ -35,6 +35,11 @@ const (
 	// By default, quota enforcement is off. It overrides openshift middleware configuration option.
 	// Recognized values are "true" and "false".
 	EnforceQuotaEnvVar = "REGISTRY_MIDDLEWARE_REPOSITORY_OPENSHIFT_ENFORCEQUOTA"
+
+	// ProjectCacheTTLEnvVar is an environment variable specifying an eviction timeout for project quota
+	// objects. It takes a valid time duration string (e.g. "2m"). If empty, you get the default timeout. If
+	// zero (e.g. "0m"), caching is disabled.
+	ProjectCacheTTLEnvVar = "REGISTRY_MIDDLEWARE_REPOSITORY_OPENSHIFT_PROJECTCACHETTL"
 )
 
 var (
@@ -47,6 +52,9 @@ var (
 	// insecureTransport is the transport pool that does not verify remote TLS certificates for use
 	// during pullthrough against registries marked as insecure.
 	insecureTransport http.RoundTripper
+	// quotaEnforcing contains shared caches of quota objects keyed by project name. Will be initialized
+	// only if the quota is enforced. See EnforceQuotaEnvVar.
+	quotaEnforcing *quotaEnforcingCaches
 )
 
 func init() {
@@ -73,6 +81,11 @@ func init() {
 	if err != nil {
 		panic(fmt.Sprintf("Unable to configure a default transport for importing insecure images: %v", err))
 	}
+
+	if os.Getenv(EnforceQuotaEnvVar) == "true" {
+		quotaEnforcing = newQuotaEnforcingCaches(os.Getenv(ProjectCacheTTLEnvVar))
+	}
+
 }
 
 // repository wraps a distribution.Repository and allows manifests to be served from the OpenShift image
@@ -88,9 +101,6 @@ type repository struct {
 	namespace        string
 	name             string
 
-	// if true, a blob write will fail when the quota is being exceeded or the quota cannot be fetched from
-	// origin server
-	enforceQuota bool
 	// if true, the repository will check remote references in the image stream to support pulling "through"
 	// from a remote repository
 	pullthrough bool
@@ -116,8 +126,6 @@ func newRepositoryWithClient(
 		return nil, errors.New("DOCKER_REGISTRY_URL is required")
 	}
 
-	enforceQuota := os.Getenv(EnforceQuotaEnvVar) == "true"
-
 	pullthrough := false
 	if value, ok := options["pullthrough"]; ok {
 		if b, ok := value.(bool); ok {
@@ -140,7 +148,6 @@ func newRepositoryWithClient(
 		registryAddr:     registryAddr,
 		namespace:        nameParts[0],
 		name:             nameParts[1],
-		enforceQuota:     enforceQuota,
 		pullthrough:      pullthrough,
 		cachedLayers:     cachedLayers,
 	}, nil
@@ -163,7 +170,7 @@ func (r *repository) Blobs(ctx context.Context) distribution.BlobStore {
 
 	bs := r.Repository.Blobs(ctx)
 
-	if r.enforceQuota {
+	if quotaEnforcing != nil {
 		bs = &quotaRestrictedBlobStore{
 			BlobStore: bs,
 
