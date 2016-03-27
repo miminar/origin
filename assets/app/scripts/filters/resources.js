@@ -826,6 +826,7 @@ angular.module('openshiftConsole')
         'memory': 'Memory (Request)',
         'openshift.io/image-size': 'Image Size',
         'openshift.io/imagestreamimages': 'Image Stream Images',
+        'openshift.io/imagestreamtags': 'Image Stream Tags',
         'persistentvolumeclaims': 'Persistent Volume Claims',
         'pods': 'Pods',
         'replicationcontrollers': 'Replication Controllers',

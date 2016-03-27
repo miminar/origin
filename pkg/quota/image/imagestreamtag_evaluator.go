@@ -24,6 +24,7 @@ const imageStreamTagEvaluatorName = "Evaluator.ImageStreamTag"
 // UPDATE admission operations on imageStreamTags resource.
 func NewImageStreamTagEvaluator(osClient osclient.Interface) kquota.Evaluator {
 	computeResources := []kapi.ResourceName{
+		imageapi.ResourceImageStreamTags,
 		imageapi.ResourceImageStreamImages,
 	}
 
@@ -79,6 +80,7 @@ func makeImageStreamTagAdmissionUsageFunc(osClient osclient.Interface) generic.U
 		}
 
 		res := map[kapi.ResourceName]resource.Quantity{
+			imageapi.ResourceImageStreamTags:   *resource.NewQuantity(0, resource.BinarySI),
 			imageapi.ResourceImageStreamImages: *resource.NewQuantity(0, resource.BinarySI),
 		}
 
@@ -98,7 +100,7 @@ func makeImageStreamTagAdmissionUsageFunc(osClient osclient.Interface) generic.U
 			return res
 		}
 
-		c := NewGenericImageStreamUsageComputer(osClient, true)
+		c := NewGenericImageStreamUsageComputer(osClient)
 
 		ref, err := c.GetImageReferenceForObjectReference(ist.Namespace, ist.Tag.From)
 		if err != nil {
@@ -106,13 +108,14 @@ func makeImageStreamTagAdmissionUsageFunc(osClient osclient.Interface) generic.U
 			return res
 		}
 
-		_, imagesIncrement, err := c.GetProjectImagesUsageIncrement(ist.Namespace, nil, ref)
+		_, specRefsIncrement, _, statusRefsIncrement, err := c.GetProjectImagesUsageIncrement(ist.Namespace, nil, ref, "")
 		if err != nil {
 			utilruntime.HandleError(fmt.Errorf("failed to get namespace usage increment of %q with an image reference %q: %v", ist.Namespace, ref, err))
 			return res
 		}
 
-		res[imageapi.ResourceImageStreamImages] = *imagesIncrement
+		res[imageapi.ResourceImageStreamTags] = *specRefsIncrement
+		res[imageapi.ResourceImageStreamImages] = *statusRefsIncrement
 
 		return res
 	}

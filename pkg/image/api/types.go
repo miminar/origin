@@ -34,6 +34,10 @@ const (
 	// ResourceImageStreamImages represents a number of unique references to images in a project.
 	ResourceImageStreamImages kapi.ResourceName = "openshift.io/imagestreamimages"
 
+	// ResourceImageStreamTags represents a number of unique references to images in all image stream specs
+	// of a project.
+	ResourceImageStreamTags kapi.ResourceName = "openshift.io/imagestreamtags"
+
 	// Limit that applies to images.  Used with a max["storage"] LimitRangeItem to set
 	// the maximum size of an image.
 	LimitTypeImageSize kapi.LimitType = "openshift.io/image-size"

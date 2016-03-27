@@ -6,12 +6,33 @@ import (
 
 	kapi "k8s.io/kubernetes/pkg/api"
 	kerrors "k8s.io/kubernetes/pkg/api/errors"
+	"k8s.io/kubernetes/pkg/api/resource"
 	ktestclient "k8s.io/kubernetes/pkg/client/unversioned/testclient"
 	"k8s.io/kubernetes/pkg/runtime"
 
 	imageapi "github.com/openshift/origin/pkg/image/api"
 )
 
+// InternalRegistryURL is an url of internal docker registry for testing purposes.
+const InternalRegistryURL = "172.30.12.34:5000"
+
+// ExpectedResourceListFor creates a resource list with image stream images and
+// image stream tags resources set based on given values.
+func ExpectedResourceListFor(expectedSpecRefs, expectedRefs int64) kapi.ResourceList {
+	return kapi.ResourceList{
+		imageapi.ResourceImageStreamTags:   *resource.NewQuantity(expectedSpecRefs, resource.DecimalSI),
+		imageapi.ResourceImageStreamImages: *resource.NewQuantity(expectedRefs, resource.DecimalSI),
+	}
+}
+
+// MakeDockerImageReference makes a docker image reference string referencing testing internal docker
+// registry.
+func MakeDockerImageReference(ns, isName, imageID string) string {
+	return fmt.Sprintf("%s/%s/%s@%s", InternalRegistryURL, ns, isName, imageID)
+}
+
+// GetFakeImageStreamListHandler creates a test handler that lists given image streams matching requested
+// namespace. Addionally, a shared image stream will be listed if the requested namespace is "shared".
 func GetFakeImageStreamListHandler(t *testing.T, iss ...imageapi.ImageStream) ktestclient.ReactionFunc {
 	sharedISs := []imageapi.ImageStream{*GetSharedImageStream("shared", "is")}
 	allISs := append(sharedISs, iss...)
@@ -36,6 +57,9 @@ func GetFakeImageStreamListHandler(t *testing.T, iss ...imageapi.ImageStream) kt
 	}
 }
 
+// GetFakeImageStreamGetHandler creates a test handler to be used as a reactor with  ktestclient.Fake client
+// that handles Get request on image stream resource. Matching is from given image stream list will be
+// returned if found. Additionally, a shared image stream may be requested.
 func GetFakeImageStreamGetHandler(t *testing.T, iss ...imageapi.ImageStream) ktestclient.ReactionFunc {
 	sharedISs := []imageapi.ImageStream{*GetSharedImageStream("shared", "is")}
 	allISs := append(sharedISs, iss...)
@@ -58,6 +82,8 @@ func GetFakeImageStreamGetHandler(t *testing.T, iss ...imageapi.ImageStream) kte
 	}
 }
 
+// GetSharedImageStream returns an image stream having all the testing images tagged in its status under
+// latest tag.
 func GetSharedImageStream(namespace, name string) *imageapi.ImageStream {
 	tevList := imageapi.TagEventList{}
 	for _, imgName := range []string{
@@ -69,7 +95,7 @@ func GetSharedImageStream(namespace, name string) *imageapi.ImageStream {
 	} {
 		tevList.Items = append(tevList.Items,
 			imageapi.TagEvent{
-				DockerImageReference: fmt.Sprintf("172.30.12.34:5000/test/is@%s", imgName),
+				DockerImageReference: MakeDockerImageReference("test", "is", imgName),
 				Image:                imgName,
 			})
 	}

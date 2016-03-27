@@ -48,6 +48,7 @@ func NewImageStreamEvaluator(osClient osclient.Interface) kquota.Evaluator {
 // plugin.
 func NewImageStreamAdmissionEvaluator(osClient osclient.Interface) kquota.Evaluator {
 	computeResources := []kapi.ResourceName{
+		imageapi.ResourceImageStreamTags,
 		imageapi.ResourceImageStreamImages,
 	}
 
@@ -84,8 +85,9 @@ func imageStreamConstraintsFunc(required []kapi.ResourceName, object runtime.Obj
 func makeImageStreamUsageComputerFactory(osClient osclient.Interface) quotautil.UsageComputerFactory {
 	return func() quotautil.UsageComputer {
 		return &imageStreamUsageComputer{
-			GenericImageStreamUsageComputer: *NewGenericImageStreamUsageComputer(osClient, true),
-			processedImages:                 sets.NewString(),
+			GenericImageStreamUsageComputer: *NewGenericImageStreamUsageComputer(osClient),
+			processedSpecRefs:               sets.NewString(),
+			processedStatusRefs:             sets.NewString(),
 		}
 	}
 }
@@ -93,7 +95,8 @@ func makeImageStreamUsageComputerFactory(osClient osclient.Interface) quotautil.
 // imageStreamUsageComputer is a context object for use in SharedContextEvaluator.
 type imageStreamUsageComputer struct {
 	GenericImageStreamUsageComputer
-	processedImages sets.String
+	processedSpecRefs   sets.String
+	processedStatusRefs sets.String
 }
 
 // Usage returns a usage for an image stream.
@@ -103,9 +106,10 @@ func (c *imageStreamUsageComputer) Usage(object runtime.Object) kapi.ResourceLis
 		return kapi.ResourceList{}
 	}
 
-	images := c.GetImageStreamUsage(is, c.processedImages)
+	specRefs, statusRefs := c.GetImageStreamUsage(is, c.processedSpecRefs, c.processedStatusRefs)
 	return kapi.ResourceList{
-		imageapi.ResourceImageStreamImages: *images,
+		imageapi.ResourceImageStreamTags:   *specRefs,
+		imageapi.ResourceImageStreamImages: *statusRefs,
 	}
 }
 
@@ -117,16 +121,17 @@ func makeImageStreamAdmissionUsageFunc(osClient osclient.Interface) generic.Usag
 			return kapi.ResourceList{}
 		}
 
-		c := NewGenericImageStreamUsageComputer(osClient, true)
+		c := NewGenericImageStreamUsageComputer(osClient)
 
-		_, imagesIncrement, err := c.GetProjectImagesUsageIncrement(is.Namespace, is, "")
+		_, specRefsIncrement, _, statusRefsIncrement, err := c.GetProjectImagesUsageIncrement(is.Namespace, is, "", "")
 		if err != nil {
 			utilruntime.HandleError(fmt.Errorf("failed to compute project images usage increment in namespace %q: %v", is.Namespace, err))
 			return kapi.ResourceList{}
 		}
 
 		return map[kapi.ResourceName]resource.Quantity{
-			imageapi.ResourceImageStreamImages: *imagesIncrement,
+			imageapi.ResourceImageStreamTags:   *specRefsIncrement,
+			imageapi.ResourceImageStreamImages: *statusRefsIncrement,
 		}
 	}
 }

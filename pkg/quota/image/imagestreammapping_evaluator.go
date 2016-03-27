@@ -23,6 +23,7 @@ const imageStreamMappingName = "Evaluator.ImageStreamMapping"
 // the admission can work.
 func NewImageStreamMappingEvaluator(osClient osclient.Interface) kquota.Evaluator {
 	computeResources := []kapi.ResourceName{
+		imageapi.ResourceImageStreamTags,
 		imageapi.ResourceImageStreamImages,
 	}
 
@@ -57,7 +58,12 @@ func makeImageStreamMappingAdmissionUsageFunc(osClient osclient.Interface) gener
 			return kapi.ResourceList{}
 		}
 
-		c := NewGenericImageStreamUsageComputer(osClient, false)
+		c := NewGenericImageStreamUsageComputer(osClient)
+
+		res := kapi.ResourceList{
+			imageapi.ResourceImageStreamTags:   *resource.NewQuantity(0, resource.DecimalSI),
+			imageapi.ResourceImageStreamImages: *resource.NewQuantity(0, resource.DecimalSI),
+		}
 
 		// If the target image stream does not exist, return 0 increment because the CREATE operation will
 		// fail and we need to prevent an increment of quota's usage.
@@ -66,19 +72,16 @@ func makeImageStreamMappingAdmissionUsageFunc(osClient osclient.Interface) gener
 			if !kerrors.IsNotFound(err) {
 				utilruntime.HandleError(fmt.Errorf("failed to get image stream %s/%s: %v", ism.Namespace, ism.Name, err))
 			}
-			return kapi.ResourceList{
-				imageapi.ResourceImageStreamImages: *resource.NewQuantity(0, resource.DecimalSI),
-			}
+			return res
 		}
 
-		_, imagesIncrement, err := c.GetProjectImagesUsageIncrement(ism.Namespace, nil, ism.Image.DockerImageReference)
+		_, _, _, statusRefsIncrement, err := c.GetProjectImagesUsageIncrement(ism.Namespace, nil, "", ism.Image.Name)
 		if err != nil {
 			utilruntime.HandleError(fmt.Errorf("failed to get project images usage increment of %q caused by an image %q: %v", ism.Namespace, ism.Image.Name, err))
-			return map[kapi.ResourceName]resource.Quantity{}
+			return res
 		}
 
-		return kapi.ResourceList{
-			imageapi.ResourceImageStreamImages: *imagesIncrement,
-		}
+		res[imageapi.ResourceImageStreamImages] = *statusRefsIncrement
+		return res
 	}
 }
