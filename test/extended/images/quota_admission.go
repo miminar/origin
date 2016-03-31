@@ -1,17 +1,16 @@
 package images
 
 import (
-	cryptorand "crypto/rand"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"path"
-	"strings"
+	"strconv"
 	"time"
 
 	kapi "k8s.io/kubernetes/pkg/api"
+	kerrors "k8s.io/kubernetes/pkg/api/errors"
 	"k8s.io/kubernetes/pkg/api/resource"
-	kerrutil "k8s.io/kubernetes/pkg/util/errors"
+	kclient "k8s.io/kubernetes/pkg/client/unversioned"
+	kutilerrors "k8s.io/kubernetes/pkg/util/errors"
 
 	g "github.com/onsi/ginkgo"
 	o "github.com/onsi/gomega"
@@ -23,14 +22,14 @@ import (
 const (
 	imageSize = 100
 
-	quotaName = "all-quota-set"
+	quotaName = "image-quota"
 
-	waitTimeout = time.Second * 5
+	waitTimeout = time.Second * 30
 )
 
-var _ = g.Describe("[images] openshift image resource quota", func() {
+var _ = g.Describe("[images] openshift image quota admission limiting image references", func() {
 	defer g.GinkgoRecover()
-	var oc = exutil.NewCLI("imagequota-admission", exutil.KubeConfigPath())
+	var oc = exutil.NewCLI("resourcequota-admission", exutil.KubeConfigPath())
 
 	g.JustBeforeEach(func() {
 		g.By("Waiting for builder service account")
@@ -38,95 +37,65 @@ var _ = g.Describe("[images] openshift image resource quota", func() {
 		o.Expect(err).NotTo(o.HaveOccurred())
 	})
 
-	g.AfterEach(func() {
+	// needs to be run at the of of each It; cannot be run in AfterEach which is run after the project
+	// is destroyed
+	tearDown := func(oc *exutil.CLI) {
 		g.By(fmt.Sprintf("Deleting quota %s", quotaName))
 		oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Delete(quotaName)
 
-		g.By("Deleting images")
-		iss, err := oc.AdminREST().ImageStreams(oc.Namespace()).List(kapi.ListOptions{})
-		o.Expect(err).NotTo(o.HaveOccurred())
-		for _, is := range iss.Items {
-			for _, history := range is.Status.Tags {
-				for i := range history.Items {
-					oc.AdminREST().Images().Delete(history.Items[i].Image)
-				}
-			}
-			for _, tagRef := range is.Spec.Tags {
-				switch tagRef.From.Kind {
-				case "ImageStreamImage":
-					nameParts := strings.Split(tagRef.From.Name, "@")
-					if len(nameParts) != 2 {
-						continue
-					}
-					imageName := nameParts[1]
-					oc.AdminREST().Images().Delete(imageName)
-				}
-			}
-			err := oc.AdminREST().ImageStreams(is.Namespace).Delete(is.Name)
-			o.Expect(err).NotTo(o.HaveOccurred())
-		}
-
-		g.By("Deleting shared project")
-		oc.AdminREST().Projects().Delete(oc.Namespace() + "-shared")
-	})
+		deleteTestImagesAndStreams(oc)
+	}
 
 	g.It("should deny a push of image exceeding quota", func() {
 		oc.SetOutputDir(exutil.TestContext.OutputDir)
+		defer tearDown(oc)
 
-		rq := &kapi.ResourceQuota{
-			ObjectMeta: kapi.ObjectMeta{
-				Name: quotaName,
-			},
-			Spec: kapi.ResourceQuotaSpec{
-				Hard: kapi.ResourceList{
-					imageapi.ResourceImageStreamImages: resource.MustParse("0"),
-				},
-			},
+		hard := kapi.ResourceList{
+			imageapi.ResourceImageStreamTags:   resource.MustParse("0"),
+			imageapi.ResourceImageStreamImages: resource.MustParse("0"),
 		}
-
-		g.By("resource quota needs to be created")
-		_, err := oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Create(rq)
-		o.Expect(err).NotTo(o.HaveOccurred())
-		g.By(fmt.Sprintf("trying to push image exceeding %s=%d quota", imageapi.ResourceImageStreamImages, 0))
-		buildAndPushImage(oc, oc.Namespace(), "sized", "refused", true)
-
-		g.By(fmt.Sprintf("bump the %q quota to %d", imageapi.ResourceImageStreamImages, 1))
-		rq, err = oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Get(quotaName)
-		o.Expect(err).NotTo(o.HaveOccurred())
-		rq.Spec.Hard[imageapi.ResourceImageStreamImages] = resource.MustParse("1")
-		_, err = oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Update(rq)
+		_, err := createResourceQuota(oc, hard)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		g.By(fmt.Sprintf("trying to push image below %s=%d quota", imageapi.ResourceImageStreamImages, 1))
-		buildAndPushImage(oc, oc.Namespace(), "sized", "first", false)
-		used, err := waitForResourceQuotaSync(oc, quotaName, rq.Spec.Hard)
-		o.Expect(err).NotTo(o.HaveOccurred())
-		o.Expect(assertQuotasEqual(used, rq.Spec.Hard)).NotTo(o.HaveOccurred())
-
-		g.By(fmt.Sprintf("trying to push image exceeding %s=%d quota", imageapi.ResourceImageStreamImages, 1))
-		buildAndPushImage(oc, oc.Namespace(), "sized", "second", true)
-
-		g.By(fmt.Sprintf("trying to push image exceeding %s=%q quota to another repository", imageapi.ResourceImageStreanImages, 1))
-		buildAndPushImage(oc, oc.Namespace(), "other", "third", true)
-
-		g.By(fmt.Sprintf("bump the %q quota to %d", imageapi.ResourceImageStreamImages, 2))
-		rq, err = oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Get(quotaName)
-		o.Expect(err).NotTo(o.HaveOccurred())
-		rq.Spec.Hard[imageapi.ResourceImageStreamImages] = resource.MustParse("2")
-		_, err = oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Update(rq)
+		g.By(fmt.Sprintf("trying to push image exceeding quota %v", hard))
+		err = BuildAndPushImageOfSize(oc, oc.Namespace(), "sized", "refused", imageSize, 2, false)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		g.By(fmt.Sprintf("trying to push image below %s=%d quota", imageapi.ResourceImageStreamImages, 2))
-		buildAndPushImage(oc, oc.Namespace(), "other", "second", false)
-		used, err = waitForResourceQuotaSync(oc, quotaName, rq.Spec.Hard)
+		hard, err = bumpQuota(oc, imageapi.ResourceImageStreamImages, 1)
 		o.Expect(err).NotTo(o.HaveOccurred())
-		o.Expect(assertQuotasEqual(used, rq.Spec.Hard)).NotTo(o.HaveOccurred())
 
-		g.By(fmt.Sprintf("trying to push image exceeding %s=%d quota", imageapi.ResourceImageStreamImages, 2))
-		buildAndPushImage(oc, oc.Namespace(), "other", "refused", true)
+		g.By(fmt.Sprintf("trying to push image below quota %v", hard))
+		err = BuildAndPushImageOfSize(oc, oc.Namespace(), "sized", "first", imageSize, 2, true)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		used, err := waitForResourceQuotaSync(oc, quotaName, hard)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		o.Expect(assertQuotasEqual(used, hard)).NotTo(o.HaveOccurred())
 
-		g.By(fmt.Sprintf("trying to push image exceeding %s=%d quota to a new repository", imageapi.ResourceImageStreamImages, 2))
-		buildAndPushImage(oc, oc.Namespace(), "new", "refused", true)
+		g.By(fmt.Sprintf("trying to push image exceeding quota %v", hard))
+		err = BuildAndPushImageOfSize(oc, oc.Namespace(), "sized", "second", imageSize, 2, false)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		g.By(fmt.Sprintf("trying to push image exceeding quota %v to another repository", hard))
+		err = BuildAndPushImageOfSize(oc, oc.Namespace(), "other", "third", imageSize, 2, false)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		hard, err = bumpQuota(oc, imageapi.ResourceImageStreamImages, 2)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		g.By(fmt.Sprintf("trying to push image below quota %v", hard))
+		err = BuildAndPushImageOfSize(oc, oc.Namespace(), "other", "second", imageSize, 2, true)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		used, err = waitForResourceQuotaSync(oc, quotaName, hard)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		o.Expect(assertQuotasEqual(used, hard)).NotTo(o.HaveOccurred())
+
+		g.By(fmt.Sprintf("trying to push image exceeding quota %v", hard))
+		err = BuildAndPushImageOfSize(oc, oc.Namespace(), "other", "refused", imageSize, 2, false)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		g.By(fmt.Sprintf("trying to push image exceeding quota %v to a new repository", hard))
+		err = BuildAndPushImageOfSize(oc, oc.Namespace(), "new", "refused", imageSize, 2, false)
+		o.Expect(err).NotTo(o.HaveOccurred())
 
 		g.By("removing image sized:first")
 		err = oc.REST().ImageStreamTags(oc.Namespace()).Delete("sized", "first")
@@ -141,152 +110,170 @@ var _ = g.Describe("[images] openshift image resource quota", func() {
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		g.By(fmt.Sprintf("trying to push image below %s=%d quota", imageapi.ResourceImageStreamImages, 2))
-		buildAndPushImage(oc, oc.Namespace(), "sized", "foo", false)
-		used, err = waitForResourceQuotaSync(oc, quotaName, rq.Spec.Hard)
-		o.Expect(assertQuotasEqual(used, rq.Spec.Hard)).NotTo(o.HaveOccurred())
+		err = BuildAndPushImageOfSize(oc, oc.Namespace(), "sized", "foo", imageSize, 2, true)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		used, err = waitForResourceQuotaSync(oc, quotaName, hard)
+		o.Expect(assertQuotasEqual(used, hard)).NotTo(o.HaveOccurred())
 	})
 
-	g.It("should deny a tagging of an image exceeding quota", func() {
+	g.It(fmt.Sprintf("should deny a tagging of an image exceeding %s quota", imageapi.ResourceImageStreamTags), func() {
 		oc.SetOutputDir(exutil.TestContext.OutputDir)
+		defer tearDown(oc)
 
-		projectName := oc.Namespace()
-		sharedProjectName := projectName + "-shared"
-		g.By(fmt.Sprintf("create a new project %s to store shared images", sharedProjectName))
-		err := oc.Run("new-project").Args(sharedProjectName).Execute()
-		o.Expect(err).NotTo(o.HaveOccurred())
-		oc.SetNamespace(sharedProjectName)
-
-		tag2Image := make(map[string]imageapi.Image)
-		for i := 1; i <= 5; i++ {
-			tag := fmt.Sprintf("%d", i)
-			buildAndPushImage(oc, sharedProjectName, "src", tag, false)
-			ist, err := oc.REST().ImageStreamTags(sharedProjectName).Get("src", tag)
-			o.Expect(err).NotTo(o.HaveOccurred())
-			tag2Image[tag] = ist.Image
-		}
-
-		g.By(fmt.Sprintf("switch back to the original project %s", projectName))
-		err = oc.Run("project").Args(projectName).Execute()
-		oc.SetNamespace(projectName)
+		sharedProjectName, _, err := buildTestImagesInSharedNamespace(oc, 2)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		rq := &kapi.ResourceQuota{
-			ObjectMeta: kapi.ObjectMeta{
-				Name: quotaName,
-			},
-			Spec: kapi.ResourceQuotaSpec{Hard: kapi.ResourceList{imageapi.ResourceImageStreamImages: resource.MustParse("0")}},
-		}
-
-		g.By(fmt.Sprintf("creating resource quota with a limit %s=%d", imageapi.ResourceImageStreamImages, 0))
-		_, err = oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Create(rq)
-		o.Expect(err).NotTo(o.HaveOccurred())
-		waitForLimitSync(oc, quotaName, rq.Spec.Hard)
-
-		g.By("waiting for resource quota to get in sync")
-		err = waitForLimitSync(oc, quotaName, rq.Spec.Hard)
+		hard := kapi.ResourceList{imageapi.ResourceImageStreamTags: resource.MustParse("0")}
+		_, err = createResourceQuota(oc, hard)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		g.By(fmt.Sprintf("trying to tag an image exceeding %s=%d quota", imageapi.ResourceImageStreamImages, 0))
-		out, err := oc.Run("tag").Args(sharedProjectName+"/src:1", "is:1").Output()
+		g.By(fmt.Sprintf("trying to tag an image exceeding %v", hard))
+		out, err := oc.Run("tag").Args(sharedProjectName+"/src:tag1", "is:tag1").Output()
 		o.Expect(err).To(o.HaveOccurred())
 		o.Expect(out).Should(o.MatchRegexp("(?i)exceeded quota"))
-		o.Expect(out).Should(o.ContainSubstring(string(imageapi.ResourceImageStreamImages)))
+		o.Expect(out).Should(o.ContainSubstring(string(imageapi.ResourceImageStreamTags)))
 
-		g.By(fmt.Sprintf("bump the %s quota to %d", imageapi.ResourceImageStreamImages, 1))
-		rq, err = oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Get(quotaName)
-		o.Expect(err).NotTo(o.HaveOccurred())
-		rq.Spec.Hard[imageapi.ResourceImageStreamImages] = resource.MustParse("1")
-		_, err = oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Update(rq)
-		o.Expect(err).NotTo(o.HaveOccurred())
-		err = waitForLimitSync(oc, quotaName, rq.Spec.Hard)
+		hard, err = bumpQuota(oc, imageapi.ResourceImageStreamTags, 1)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		g.By(fmt.Sprintf("trying to tag an image below %s=%d quota", imageapi.ResourceImageStreamImages, 1))
-		out, err = oc.Run("tag").Args(sharedProjectName+"/src:1", "is:1").Output()
+		g.By(fmt.Sprintf("trying to tag an image below quota %v", hard))
+		out, err = oc.Run("tag").Args(sharedProjectName+"/src:tag1", "is:tag1").Output()
 		o.Expect(err).NotTo(o.HaveOccurred())
-		used, err := waitForResourceQuotaSync(oc, quotaName, rq.Spec.Hard)
+		used, err := waitForResourceQuotaSync(oc, quotaName, hard)
 		o.Expect(err).NotTo(o.HaveOccurred())
-		o.Expect(assertQuotasEqual(used, rq.Spec.Hard)).NotTo(o.HaveOccurred())
+		o.Expect(assertQuotasEqual(used, hard)).NotTo(o.HaveOccurred())
 
-		g.By(fmt.Sprintf("trying to tag an image exceeding %s=%d quota", imageapi.ResourceImageStreamImages, 1))
-		out, err = oc.Run("tag").Args(sharedProjectName+"/src:2", "is:2").Output()
+		g.By(fmt.Sprintf("trying to tag an image exceeding quota %v", hard))
+		out, err = oc.Run("tag").Args(sharedProjectName+"/src:tag2", "is:tag2").Output()
 		o.Expect(err).To(o.HaveOccurred())
 		o.Expect(out).Should(o.MatchRegexp("(?i)exceeded quota"))
-		o.Expect(out).Should(o.ContainSubstring(string(imageapi.ResourceImageStreamImages)))
+		o.Expect(out).Should(o.ContainSubstring(string(imageapi.ResourceImageStreamTags)))
 
 		g.By("re-tagging the image under different tag")
-		out, err = oc.Run("tag").Args(sharedProjectName+"/src:1", "is:1again").Output()
+		out, err = oc.Run("tag").Args(sharedProjectName+"/src:tag1", "is:1again").Output()
 		o.Expect(err).NotTo(o.HaveOccurred())
-		used, err = waitForResourceQuotaSync(oc, quotaName, rq.Spec.Hard)
+		used, err = waitForResourceQuotaSync(oc, quotaName, hard)
 		o.Expect(err).NotTo(o.HaveOccurred())
-		o.Expect(assertQuotasEqual(used, rq.Spec.Hard)).NotTo(o.HaveOccurred())
+		o.Expect(assertQuotasEqual(used, hard)).NotTo(o.HaveOccurred())
 
-		g.By(fmt.Sprintf("bump the %s quota to %d", imageapi.ResourceImageStreamImages, 2))
-		rq, err = oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Get(quotaName)
-		o.Expect(err).NotTo(o.HaveOccurred())
-		rq.Spec.Hard[imageapi.ResourceImageStreamImages] = resource.MustParse("2")
-		_, err = oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Update(rq)
-		o.Expect(err).NotTo(o.HaveOccurred())
-		err = waitForLimitSync(oc, quotaName, rq.Spec.Hard)
+		hard, err = bumpQuota(oc, imageapi.ResourceImageStreamTags, 2)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		g.By(fmt.Sprintf("trying to alias tag a second image below %s=%d quota", imageapi.ResourceImageStreamImages, 2))
-		out, err = oc.Run("tag").Args("--alias", "--source=istag", sharedProjectName+"/src:2", "other:2").Output()
+		g.By(fmt.Sprintf("trying to alias tag a second image below quota %v", hard))
+		out, err = oc.Run("tag").Args("--alias", "--source=istag", sharedProjectName+"/src:tag2", "other:tag2").Output()
 		o.Expect(err).NotTo(o.HaveOccurred())
-		used, err = waitForResourceQuotaSync(oc, quotaName, rq.Spec.Hard)
+		used, err = waitForResourceQuotaSync(oc, quotaName, hard)
 		o.Expect(err).NotTo(o.HaveOccurred())
-		o.Expect(assertQuotasEqual(used, rq.Spec.Hard)).NotTo(o.HaveOccurred())
-
-		g.By(fmt.Sprintf("trying to alias tag a second image exceeding %s=%d quota", imageapi.ResourceImageStreamImages, 2))
-		out, err = oc.Run("tag").Args("--alias", "--source=istag", sharedProjectName+"/src:3", "other:3").Output()
-		o.Expect(err).To(o.HaveOccurred())
-		o.Expect(out).Should(o.MatchRegexp("(?i)exceeded quota"))
-		o.Expect(out).Should(o.ContainSubstring(string(imageapi.ResourceImageStreamImages)))
+		o.Expect(assertQuotasEqual(used, hard)).NotTo(o.HaveOccurred())
 
 		g.By("re-tagging the image under different tag")
-		out, err = oc.Run("tag").Args("--alias", "--source=istag", sharedProjectName+"/src:2", "another:2again").Output()
+		out, err = oc.Run("tag").Args("--alias", "--source=istag", sharedProjectName+"/src:tag2", "another:2again").Output()
 		o.Expect(err).NotTo(o.HaveOccurred())
-		used, err = waitForResourceQuotaSync(oc, quotaName, rq.Spec.Hard)
+		used, err = waitForResourceQuotaSync(oc, quotaName, hard)
 		o.Expect(err).NotTo(o.HaveOccurred())
-		o.Expect(assertQuotasEqual(used, rq.Spec.Hard)).NotTo(o.HaveOccurred())
+		o.Expect(assertQuotasEqual(used, hard)).NotTo(o.HaveOccurred())
 
-		g.By(fmt.Sprintf("bump the %s quota to %d", imageapi.ResourceImageStreamImages, 3))
-		rq, err = oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Get(quotaName)
-		o.Expect(err).NotTo(o.HaveOccurred())
-		rq.Spec.Hard[imageapi.ResourceImageStreamImages] = resource.MustParse("3")
-		_, err = oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Update(rq)
-		o.Expect(err).NotTo(o.HaveOccurred())
-		err = waitForLimitSync(oc, quotaName, rq.Spec.Hard)
+		g.By(fmt.Sprintf("re-tagging another image should exceed quota %v", hard))
+		out, err = oc.Run("tag").Args("--alias", "--source=istag", sharedProjectName+"/src:tag1", "another:1again").Output()
+		o.Expect(err).To(o.HaveOccurred())
+		o.Expect(out).Should(o.MatchRegexp("(?i)exceeded quota"))
+		o.Expect(out).Should(o.ContainSubstring(string(imageapi.ResourceImageStreamTags)))
+	})
+
+	g.It(fmt.Sprintf("should deny a tagging of an image exceeding %s quota using istag", imageapi.ResourceImageStreamTags), func() {
+		oc.SetOutputDir(exutil.TestContext.OutputDir)
+		defer tearDown(oc)
+
+		sharedProjectName, tag2Image, err := buildTestImagesInSharedNamespace(oc, 3)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		g.By(fmt.Sprintf("trying to create ImageStreamTag referencing isimage below %s=%d limit", imageapi.ResourceImageStreamImages, 3))
+		hard := kapi.ResourceList{imageapi.ResourceImageStreamTags: resource.MustParse("1")}
+		_, err = createResourceQuota(oc, hard)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		g.By(fmt.Sprintf("trying to create ImageStreamTag referencing isimage below quota %v", hard))
 		ist := &imageapi.ImageStreamTag{
 			ObjectMeta: kapi.ObjectMeta{
-				Name: "dest:3",
+				Name: "dest:tag1",
+			},
+			Tag: &imageapi.TagReference{
+				Name: "1",
+				From: &kapi.ObjectReference{
+					Kind:      "ImageStreamImage",
+					Namespace: sharedProjectName,
+					Name:      "src@" + tag2Image["tag1"].Name,
+				},
+			},
+		}
+		ist, err = oc.REST().ImageStreamTags(oc.Namespace()).Update(ist)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		g.By(fmt.Sprintf("trying to create ImageStreamTag referencing isimage exceeding quota %v", hard))
+		ist = &imageapi.ImageStreamTag{
+			ObjectMeta: kapi.ObjectMeta{
+				Name: "dest:tag2",
+			},
+			Tag: &imageapi.TagReference{
+				Name: "2",
+				From: &kapi.ObjectReference{
+					Kind:      "ImageStreamImage",
+					Namespace: sharedProjectName,
+					Name:      "src@" + tag2Image["tag2"].Name,
+				},
+			},
+		}
+		_, err = oc.REST().ImageStreamTags(oc.Namespace()).Update(ist)
+		o.Expect(err).To(o.HaveOccurred())
+		o.Expect(err.Error()).Should(o.MatchRegexp("(?i)exceeded quota"))
+
+		g.By("trying to create ImageStreamTag referencing isimage already referenced")
+		ist = &imageapi.ImageStreamTag{
+			ObjectMeta: kapi.ObjectMeta{
+				Name: "dest:tag1again",
+			},
+			Tag: &imageapi.TagReference{
+				Name: "tag1again",
+				From: &kapi.ObjectReference{
+					Kind:      "ImageStreamImage",
+					Namespace: sharedProjectName,
+					Name:      "src@" + tag2Image["tag1"].Name,
+				},
+			},
+		}
+		_, err = oc.REST().ImageStreamTags(oc.Namespace()).Update(ist)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		_, err = bumpQuota(oc, imageapi.ResourceImageStreamTags, 2)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		g.By(fmt.Sprintf("trying to create ImageStreamTag referencing istag below quota %v", hard))
+		ist = &imageapi.ImageStreamTag{
+			ObjectMeta: kapi.ObjectMeta{
+				Name: "dest:tag2",
+			},
+			Tag: &imageapi.TagReference{
+				Name: "2",
+				From: &kapi.ObjectReference{
+					Kind:      "ImageStreamTag",
+					Namespace: sharedProjectName,
+					Name:      "src:tag2",
+				},
+			},
+		}
+		ist, err = oc.REST().ImageStreamTags(oc.Namespace()).Update(ist)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		g.By(fmt.Sprintf("trying to create ImageStreamTag referencing istag exceeding quota %v", hard))
+		ist = &imageapi.ImageStreamTag{
+			ObjectMeta: kapi.ObjectMeta{
+				Name: "dest:tag3",
 			},
 			Tag: &imageapi.TagReference{
 				Name: "3",
 				From: &kapi.ObjectReference{
-					Kind:      "ImageStreamImage",
+					Kind:      "ImageStreamTag",
 					Namespace: sharedProjectName,
-					Name:      "src@" + tag2Image["3"].Name,
-				},
-			},
-		}
-		ist, err = oc.REST().ImageStreamTags(oc.Namespace()).Update(ist)
-		o.Expect(err).NotTo(o.HaveOccurred())
-
-		g.By(fmt.Sprintf("trying to create ImageStreamTag referencing isimage exceeding %s=%d quota", imageapi.ResourceImageStreamImages, 3))
-		ist = &imageapi.ImageStreamTag{
-			ObjectMeta: kapi.ObjectMeta{
-				Name: "dest:4",
-			},
-			Tag: &imageapi.TagReference{
-				Name: "4",
-				From: &kapi.ObjectReference{
-					Kind:      "ImageStreamImage",
-					Namespace: sharedProjectName,
-					Name:      "src@" + tag2Image["4"].Name,
+					Name:      "src:tag3",
 				},
 			},
 		}
@@ -294,74 +281,65 @@ var _ = g.Describe("[images] openshift image resource quota", func() {
 		o.Expect(err).To(o.HaveOccurred())
 		o.Expect(err.Error()).Should(o.MatchRegexp("(?i)exceeded quota"))
 
-		g.By(fmt.Sprintf("bump the %s quota to %d", imageapi.ResourceImageStreamImages, 4))
-		rq, err = oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Get(quotaName)
-		o.Expect(err).NotTo(o.HaveOccurred())
-		rq.Spec.Hard[imageapi.ResourceImageStreamImages] = resource.MustParse("4")
-		_, err = oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Update(rq)
-		o.Expect(err).NotTo(o.HaveOccurred())
-		err = waitForLimitSync(oc, quotaName, rq.Spec.Hard)
-		o.Expect(err).NotTo(o.HaveOccurred())
-
-		g.By(fmt.Sprintf("trying to create ImageStreamTag referencing istag below %s=%d limit", imageapi.ResourceImageStreamImages, 4))
+		g.By("trying to create ImageStreamTag referencing istag already referenced")
 		ist = &imageapi.ImageStreamTag{
 			ObjectMeta: kapi.ObjectMeta{
-				Name: "dest:4",
+				Name: "dest:tag2again",
 			},
 			Tag: &imageapi.TagReference{
-				Name: "4",
+				Name: "tag2again",
 				From: &kapi.ObjectReference{
 					Kind:      "ImageStreamTag",
 					Namespace: sharedProjectName,
-					Name:      "src:4",
-				},
-			},
-		}
-		ist, err = oc.REST().ImageStreamTags(oc.Namespace()).Update(ist)
-		o.Expect(err).NotTo(o.HaveOccurred())
-
-		g.By(fmt.Sprintf("trying to create ImageStreamTag referencing istag exceeding %s=%d quota", imageapi.ResourceImageStreamImages, 4))
-		ist = &imageapi.ImageStreamTag{
-			ObjectMeta: kapi.ObjectMeta{
-				Name: "dest:5",
-			},
-			Tag: &imageapi.TagReference{
-				Name: "5",
-				From: &kapi.ObjectReference{
-					Kind:      "ImageStreamTag",
-					Namespace: sharedProjectName,
-					Name:      "src:5",
+					Name:      "src:tag2",
 				},
 			},
 		}
 		_, err = oc.REST().ImageStreamTags(oc.Namespace()).Update(ist)
+		o.Expect(err).NotTo(o.HaveOccurred())
+	})
+
+	g.It(fmt.Sprintf("should deny a docker image reference exceeding %s quota", imageapi.ResourceImageStreamTags), func() {
+		oc.SetOutputDir(exutil.TestContext.OutputDir)
+		defer tearDown(oc)
+
+		sharedProjectName, tag2Image, err := buildTestImagesInSharedNamespace(oc, 2)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		hard := kapi.ResourceList{imageapi.ResourceImageStreamTags: resource.MustParse("0")}
+		_, err = createResourceQuota(oc, hard)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		// image importer needs to be given permissions to pull from another namespace if referencing with
+		// DockerImage
+		err = permitPullsFromNamespace(oc, sharedProjectName, oc.Namespace())
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		g.By(fmt.Sprintf("trying to tag a docker image exceeding quota %v", hard))
+		out, err := oc.Run("import-image").Args("stream:dockerimage", "--confirm", "--insecure", "--from", tag2Image["tag1"].DockerImageReference).Output()
 		o.Expect(err).To(o.HaveOccurred())
-		o.Expect(err.Error()).Should(o.MatchRegexp("(?i)exceeded quota"))
+		o.Expect(out).Should(o.MatchRegexp("(?i)exceeded quota"))
 
-		/** Test referencing using DockerImage.
-		 *
-		 * TODO: this is now failing during the image import with following status:
-		 *   Reason:"Unauthorized", Message:"you may not have access to the Docker image \"172.30.163.69:5000/extended-test-imagequota-admission-6znr2-shared/src@sha256:bb08da7a0b99af72aebe0ead77009d28771a30dbe4d99f49bf3d29407c72e48f\""
-		 * Uncomment once resolved (issue #7985).
-		 * The import seems to be working when the source and destination namespaces are the same.
-
-		g.By(fmt.Sprintf("trying to tag a docker image below %s=%d quota", imageapi.ResourceImageStreanImages, 3))
-		err = oc.Run("import-image").Args("stream:dockerimage", "--confirm", "--insecure", "--from", name2Image["3"].DockerImageReference).Execute()
+		hard, err = bumpQuota(oc, imageapi.ResourceImageStreamTags, 1)
 		o.Expect(err).NotTo(o.HaveOccurred())
-		used, err = waitForResourceQuotaSync(oc, quotaName, rq.Spec.Hard)
-		o.Expect(err).NotTo(o.HaveOccurred())
-		o.Expect(assertQuotasEqual(used, rq.Spec.Hard)).NotTo(o.HaveOccurred())
 
-		g.By(fmt.Sprintf("trying to tag a docker image exceeding %s=%d quota", imageapi.ResourceImageStreanImages, 3))
+		g.By(fmt.Sprintf("trying to tag a docker image below quota %v", hard))
+		err = oc.Run("import-image").Args("stream:dockerimage", "--confirm", "--insecure", "--from", tag2Image["tag1"].DockerImageReference).Execute()
+		o.Expect(err).NotTo(o.HaveOccurred())
 		err = waitForAnImageStreamTag(oc, "stream", "dockerimage")
 		o.Expect(err).NotTo(o.HaveOccurred())
+		used, err := waitForResourceQuotaSync(oc, quotaName, hard)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		o.Expect(assertQuotasEqual(used, hard)).NotTo(o.HaveOccurred())
+
+		g.By(fmt.Sprintf("trying to tag a docker image exceeding quota %v", hard))
 		is, err := oc.REST().ImageStreams(oc.Namespace()).Get("stream")
 		o.Expect(err).NotTo(o.HaveOccurred())
 		is.Spec.Tags["foo"] = imageapi.TagReference{
 			Name: "foo",
 			From: &kapi.ObjectReference{
 				Kind: "DockerImage",
-				Name: name2Image["4"].DockerImageReference,
+				Name: tag2Image["tag2"].DockerImageReference,
 			},
 			ImportPolicy: imageapi.TagImportPolicy{
 				Insecure: true,
@@ -378,7 +356,7 @@ var _ = g.Describe("[images] openshift image resource quota", func() {
 			Name: "duplicate",
 			From: &kapi.ObjectReference{
 				Kind: "DockerImage",
-				Name: name2Image["3"].DockerImageReference,
+				Name: tag2Image["tag1"].DockerImageReference,
 			},
 			ImportPolicy: imageapi.TagImportPolicy{
 				Insecure: true,
@@ -388,55 +366,239 @@ var _ = g.Describe("[images] openshift image resource quota", func() {
 		o.Expect(err).NotTo(o.HaveOccurred())
 		err = waitForAnImageStreamTag(oc, "stream", "duplicate")
 		o.Expect(err).NotTo(o.HaveOccurred())
-		used, err = waitForResourceQuotaSync(oc, quotaName, rq.Spec.Hard)
+		used, err = waitForResourceQuotaSync(oc, quotaName, hard)
 		o.Expect(err).NotTo(o.HaveOccurred())
-		o.Expect(assertQuotasEqual(used, rq.Spec.Hard)).NotTo(o.HaveOccurred())
-		*/
+		o.Expect(assertQuotasEqual(used, hard)).NotTo(o.HaveOccurred())
+	})
+
+	g.It(fmt.Sprintf("should deny an import of a repository exceeding %s quota", imageapi.ResourceImageStreamTags), func() {
+		oc.SetOutputDir(exutil.TestContext.OutputDir)
+		defer tearDown(oc)
+
+		maxBulkImport, err := getMaxImagesBulkImportedPerRepository()
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		s1Name, s1tag2Image, err := buildTestImagesInSharedNamespaceWithSuffix(oc, "-s1", maxBulkImport+1)
+		s2Name, s2tag2Image, err := buildTestImagesInSharedNamespaceWithSuffix(oc, "-s2", 2)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		hard := kapi.ResourceList{
+			imageapi.ResourceImageStreamTags:   *resource.NewQuantity(int64(maxBulkImport)+1, resource.DecimalSI),
+			imageapi.ResourceImageStreamImages: *resource.NewQuantity(int64(maxBulkImport)+1, resource.DecimalSI),
+		}
+		_, err = createResourceQuota(oc, hard)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		// image importer needs to be given permissions to pull from another namespace if referencing with
+		// DockerImage
+		err = permitPullsFromNamespace(oc, s1Name, oc.Namespace())
+		o.Expect(err).NotTo(o.HaveOccurred())
+		err = permitPullsFromNamespace(oc, s2Name, oc.Namespace())
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		s1ref, err := imageapi.ParseDockerImageReference(s1tag2Image["tag1"].DockerImageReference)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		s1ref.Tag = ""
+		s1ref.ID = ""
+		s2ref, err := imageapi.ParseDockerImageReference(s2tag2Image["tag1"].DockerImageReference)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		s2ref.Tag = ""
+		s2ref.ID = ""
+
+		g.By(fmt.Sprintf("trying to import from repository %q below quota %v", s1ref.Exact(), hard))
+		err = oc.Run("import-image").Args("bulkimport", "--confirm", "--insecure", "--all", "--from", s1ref.Exact()).Execute()
+		o.Expect(err).NotTo(o.HaveOccurred())
+		err = waitForAnImageStreamTag(oc, "bulkimport", "tag1")
+		o.Expect(err).NotTo(o.HaveOccurred())
+		expected := kapi.ResourceList{
+			imageapi.ResourceImageStreamTags: *resource.NewQuantity(int64(maxBulkImport), resource.DecimalSI),
+			// it will take some time before the value is bumped to maxBulkImport*2 (untill the next quota
+			// usage sync)
+			imageapi.ResourceImageStreamImages: *resource.NewQuantity(int64(maxBulkImport), resource.DecimalSI),
+		}
+		used, err := waitForResourceQuotaSync(oc, quotaName, expected)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		// we cannot be sure the quota is up to date for image stream images; check only the exact value of
+		// image stream tags
+		delete(expected, imageapi.ResourceImageStreamImages)
+		delete(used, imageapi.ResourceImageStreamImages)
+		o.Expect(assertQuotasEqual(used, expected)).NotTo(o.HaveOccurred())
+
+		g.By(fmt.Sprintf("trying to import tags from repository %q exceeding quota %v", s2ref.Exact(), hard))
+		out, err := oc.Run("import-image").Args("bulkimport", "--confirm", "--insecure", "--all", "--from", s2ref.Exact()).Output()
+		o.Expect(err).To(o.HaveOccurred())
+		o.Expect(out).Should(o.MatchRegexp("(?i)exceeded quota"))
+		o.Expect(out).Should(o.ContainSubstring(string(imageapi.ResourceImageStreamTags)))
+	})
+
+	g.It(fmt.Sprintf("should deny a tagging of an image exceeding %s quota", imageapi.ResourceImageStreamImages), func() {
+		oc.SetOutputDir(exutil.TestContext.OutputDir)
+		defer tearDown(oc)
+
+		sharedProjectName, _, err := buildTestImagesInSharedNamespace(oc, 3)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		hard := kapi.ResourceList{imageapi.ResourceImageStreamImages: resource.MustParse("0")}
+		_, err = createResourceQuota(oc, hard)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		g.By(fmt.Sprintf("trying to tag an image exceeding %v", hard))
+		out, err := oc.Run("tag").Args(sharedProjectName+"/src:tag1", "is:tag1").Output()
+		o.Expect(err).To(o.HaveOccurred())
+		o.Expect(out).Should(o.MatchRegexp("(?i)exceeded quota"))
+		o.Expect(out).Should(o.ContainSubstring(string(imageapi.ResourceImageStreamImages)))
+
+		hard, err = bumpQuota(oc, imageapi.ResourceImageStreamImages, 1)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		g.By(fmt.Sprintf("trying to tag an image below quota %v", hard))
+		err = oc.Run("tag").Args(sharedProjectName+"/src:tag1", "is:tag1").Execute()
+		o.Expect(err).NotTo(o.HaveOccurred())
+		err = waitForAnImageStreamTag(oc, "is", "tag1")
+		o.Expect(err).NotTo(o.HaveOccurred())
+		// image references in spec and status are different, but status will be added
+		// during the next quota sync
+		used, err := waitForResourceQuotaSync(oc, quotaName, hard)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		o.Expect(assertQuotasEqual(used, hard)).NotTo(o.HaveOccurred())
+
+		g.By(fmt.Sprintf("trying to tag an image exceeding quota %v", hard))
+		out, err = oc.Run("tag").Args(sharedProjectName+"/src:tag2", "is:tag2").Output()
+		o.Expect(err).To(o.HaveOccurred())
+		o.Expect(out).Should(o.MatchRegexp("(?i)exceeded quota"))
+		o.Expect(out).Should(o.ContainSubstring(string(imageapi.ResourceImageStreamImages)))
+
+		g.By("re-tagging the image under different tag")
+		err = oc.Run("tag").Args(sharedProjectName+"/src:tag1", "is:1again").Execute()
+		o.Expect(err).NotTo(o.HaveOccurred())
+		err = waitForAnImageStreamTag(oc, "is", "1again")
+		o.Expect(err).NotTo(o.HaveOccurred())
+		used, err = waitForResourceQuotaSync(oc, quotaName, hard)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		o.Expect(assertQuotasEqual(used, hard)).NotTo(o.HaveOccurred())
+
+		hard, err = bumpQuota(oc, imageapi.ResourceImageStreamImages, 2)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		g.By(fmt.Sprintf("trying to alias tag a second image below quota %v", hard))
+		err = oc.Run("tag").Args("--alias", "--source=istag", sharedProjectName+"/src:tag2", "other:tag2").Execute()
+		o.Expect(err).NotTo(o.HaveOccurred())
+		err = waitForAnImageStreamTag(oc, "other", "tag2")
+		o.Expect(err).NotTo(o.HaveOccurred())
+		err = forceQuotaResync(oc)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		used, err = waitForResourceQuotaSync(oc, quotaName, hard)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		o.Expect(assertQuotasEqual(used, hard)).NotTo(o.HaveOccurred())
+
+		// an alias cannot be gated - no usage increment is detected for istag
+		g.By("exceeding quota with another istag")
+		err = oc.Run("tag").Args("--alias", "--source=istag", sharedProjectName+"/src:tag3", "is:tag3").Execute()
+		o.Expect(err).NotTo(o.HaveOccurred())
+		err = waitForAnImageStreamTag(oc, "is", "tag3")
+		o.Expect(err).NotTo(o.HaveOccurred())
+		err = forceQuotaResync(oc)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		expected := kapi.ResourceList{imageapi.ResourceImageStreamImages: *resource.NewQuantity(3, resource.DecimalSI)}
+		used, err = waitForResourceQuotaSync(oc, quotaName, expected)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		o.Expect(assertQuotasEqual(used, expected)).NotTo(o.HaveOccurred())
+
+		// an alias cannot be gated - no usage increment is detected for istag
+		g.By("re-tagging the image under different tag should still be allowed")
+		err = oc.Run("tag").Args("--alias", "--source=istag", sharedProjectName+"/src:tag2", "another:2again").Execute()
+		o.Expect(err).NotTo(o.HaveOccurred())
+		err = waitForAnImageStreamTag(oc, "another", "2again")
+		o.Expect(err).NotTo(o.HaveOccurred())
+		err = forceQuotaResync(oc)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		used, err = waitForResourceQuotaSync(oc, quotaName, expected)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		o.Expect(assertQuotasEqual(used, expected)).NotTo(o.HaveOccurred())
 	})
 })
 
-// buildAndPushImage tries to build an image. The image is stored as an image stream tag <name>:<tag>. If
-// shouldBeDenied is true, a build will be expected to fail with a denied error.
-func buildAndPushImage(oc *exutil.CLI, namespace, name, tag string, shouldBeDenied bool) {
-	istName := name
-	if tag != "" {
-		istName += ":" + tag
+// buildTestImagesInSharedNamespaceWithSuffix creates a shared namespace derived from current project and
+// builds a given number of test images. The images are pushed to the shared namespace into src image streams
+// under tagX where X is a number of image starting from 1. The shared namespace's name is a current one plus
+// given suffix.
+func buildTestImagesInSharedNamespaceWithSuffix(oc *exutil.CLI, suffix string, numberOfImages int) (sharedProjectName string, tag2Image map[string]imageapi.Image, err error) {
+	projectName := oc.Namespace()
+	sharedProjectName = projectName + suffix
+	g.By(fmt.Sprintf("Create a new project %s to store shared images", sharedProjectName))
+	err = oc.Run("new-project").Args(sharedProjectName).Execute()
+	if err != nil {
+		return
 	}
-	g.By(fmt.Sprintf("building an image %q", istName))
+	oc.SetNamespace(sharedProjectName)
+	defer oc.SetNamespace(projectName)
 
-	bc, err := oc.REST().BuildConfigs(namespace).Get(name)
-	if err == nil {
-		g.By(fmt.Sprintf("changing build config %s to store result into %s", name, istName))
-		o.Expect(bc.Spec.BuildSpec.Output.To.Kind).To(o.Equal("ImageStreamTag"))
-		bc.Spec.BuildSpec.Output.To.Name = istName
-		_, err := oc.REST().BuildConfigs(namespace).Update(bc)
-		o.Expect(err).NotTo(o.HaveOccurred())
-	} else {
-		g.By(fmt.Sprintf("creating a new build config %s with output to %s ", name, istName))
-		err = oc.Run("new-build").Args(
-			"--binary",
-			"--name", name,
-			"--to", istName).Execute()
-		o.Expect(err).NotTo(o.HaveOccurred())
-	}
-
-	tempDir, err := ioutil.TempDir("", "name-build")
+	g.By(fmt.Sprintf("Waiting for builder service account in namespace %s", sharedProjectName))
+	err = exutil.WaitForBuilderAccount(oc.KubeREST().ServiceAccounts(sharedProjectName))
 	o.Expect(err).NotTo(o.HaveOccurred())
 
-	err = createRandomBlob(path.Join(tempDir, "data"), imageSize)
-	o.Expect(err).NotTo(o.HaveOccurred())
-	err = ioutil.WriteFile(path.Join(tempDir, "Dockerfile"), []byte("FROM scratch\nCOPY data /data\n"), 0644)
-	o.Expect(err).NotTo(o.HaveOccurred())
-
-	err = oc.Run("start-build").Args(name, "--from-dir", tempDir, "--wait").Execute()
-	if shouldBeDenied {
-		o.Expect(err).To(o.HaveOccurred())
-		out, err := oc.Run("logs").Args("bc/" + name).Output()
-		o.Expect(err).NotTo(o.HaveOccurred())
-		o.Expect(out).Should(o.MatchRegexp("(?i)Failed to push image:.*denied"))
-	} else {
-		o.Expect(err).NotTo(o.HaveOccurred())
+	tag2Image = make(map[string]imageapi.Image)
+	for i := 1; i <= numberOfImages; i++ {
+		tag := fmt.Sprintf("tag%d", i)
+		err = BuildAndPushImageOfSize(oc, sharedProjectName, "src", tag, imageSize, 2, true)
+		if err != nil {
+			return "", nil, err
+		}
+		ist, err := oc.REST().ImageStreamTags(sharedProjectName).Get("src", tag)
+		if err != nil {
+			return "", nil, err
+		}
+		tag2Image[tag] = ist.Image
 	}
+
+	g.By(fmt.Sprintf("Switch back to the original project %s", projectName))
+	err = oc.Run("project").Args(projectName).Execute()
+	if err != nil {
+		return "", nil, err
+	}
+	return
+}
+
+// buildTestImagesInSharedNamespace creates a shared namespace derived from current project and builds a given
+// number of test images. The images are pushed to the shared namespace into src image streams under tagX
+// where X is a number of image starting from 1.
+func buildTestImagesInSharedNamespace(oc *exutil.CLI, numberOfImages int) (sharedProjectName string, tag2Image map[string]imageapi.Image, err error) {
+	return buildTestImagesInSharedNamespaceWithSuffix(oc, "-shared", numberOfImages)
+}
+
+// createResourceQuota creates a resource quota with given hard limits in a current namespace and waits until
+// a first usage refresh
+func createResourceQuota(oc *exutil.CLI, hard kapi.ResourceList) (*kapi.ResourceQuota, error) {
+	rq := &kapi.ResourceQuota{
+		ObjectMeta: kapi.ObjectMeta{
+			Name: quotaName,
+		},
+		Spec: kapi.ResourceQuotaSpec{
+			Hard: hard,
+		},
+	}
+
+	g.By(fmt.Sprintf("creating resource quota with a limit %v", hard))
+	rq, err := oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Create(rq)
+	if err != nil {
+		return nil, err
+	}
+	err = waitForLimitSync(oc, hard)
+	return rq, err
+}
+
+// permitPullsFromNamespace gives privileges to service accounts in targetNamespace to pull images from
+// sourceNamespace. This is needed when referencing images in the source namespace using docker image
+// references.
+func permitPullsFromNamespace(oc *exutil.CLI, sourceNamespace, targetNamespace string) error {
+	if sourceNamespace == targetNamespace {
+		return nil
+	}
+	originalNamespace := oc.Namespace()
+	oc.SetNamespace(sourceNamespace)
+	defer oc.SetNamespace(originalNamespace)
+
+	return oc.Run("policy").Args("add-role-to-group", "system:image-puller", "system:serviceaccounts:"+targetNamespace).Execute()
 }
 
 // assertQuotasEqual compares two quota sets and returns an error with proper description when they don't match
@@ -462,7 +624,26 @@ func assertQuotasEqual(a, b kapi.ResourceList) error {
 		}
 	}
 
-	return kerrutil.NewAggregate(errs)
+	return kutilerrors.NewAggregate(errs)
+}
+
+// bumpQuota modifies hard spec of quota object with the given value. It returns modified hard spec.
+func bumpQuota(oc *exutil.CLI, resourceName kapi.ResourceName, value int64) (kapi.ResourceList, error) {
+	g.By(fmt.Sprintf("bump the quota to %s=%d", resourceName, value))
+	rq, err := oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Get(quotaName)
+	if err != nil {
+		return nil, err
+	}
+	rq.Spec.Hard[resourceName] = *resource.NewQuantity(value, resource.DecimalSI)
+	_, err = oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Update(rq)
+	if err != nil {
+		return nil, err
+	}
+	err = waitForLimitSync(oc, rq.Spec.Hard)
+	if err != nil {
+		return nil, err
+	}
+	return rq.Spec.Hard, nil
 }
 
 // waitForResourceQuotaSync waits until a usage of a quota reaches given limit with a short timeout
@@ -511,8 +692,8 @@ func waitForAnImageStreamTag(oc *exutil.CLI, name, tag string) error {
 }
 
 // waitForResourceQuotaSync waits until a usage of a quota reaches given limit with a short timeout
-func waitForLimitSync(oc *exutil.CLI, name string, hardLimit kapi.ResourceList) error {
-	g.By(fmt.Sprintf("waiting for resource quota %s to get updated", name))
+func waitForLimitSync(oc *exutil.CLI, hardLimit kapi.ResourceList) error {
+	g.By(fmt.Sprintf("waiting for resource quota %s to get updated", quotaName))
 	return exutil.WaitForResourceQuotaLimitSync(
 		oc.KubeREST().ResourceQuotas(oc.Namespace()),
 		quotaName,
@@ -520,26 +701,80 @@ func waitForLimitSync(oc *exutil.CLI, name string, hardLimit kapi.ResourceList) 
 		waitTimeout)
 }
 
-// createRandomBlob creates a random data with bytes from `letters` in order to let docker take advantage of
-// compression. Resulting layer size will be different due to file metadata overhead and compression.
-func createRandomBlob(dest string, size uint64) error {
-	var letters = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+// getMaxImagesBulkImportedPerRepository returns a maximum numbers of images that can be imported from
+// repository at once. The value is obtained from environment variable which must be set.
+func getMaxImagesBulkImportedPerRepository() (int, error) {
+	max := os.Getenv("MAX_IMAGES_BULK_IMPORTED_PER_REPOSITORY")
+	if len(max) == 0 {
+		return 0, fmt.Errorf("MAX_IMAGES_BULK_IMAGES_IMPORTED_PER_REPOSITORY needs to be set")
+	}
+	return strconv.Atoi(max)
+}
 
-	f, err := os.Create(dest)
+// deleteTestImagesAndStreams deletes test images built in current and shared namespaces.
+// It also deletes shared projects.
+func deleteTestImagesAndStreams(oc *exutil.CLI) {
+	for _, projectName := range []string{
+		oc.Namespace() + "-s2",
+		oc.Namespace() + "-s1",
+		oc.Namespace() + "-shared",
+		oc.Namespace(),
+	} {
+		g.By(fmt.Sprintf("Deleting images and image streams in project %q", projectName))
+		iss, err := oc.AdminREST().ImageStreams(projectName).List(kapi.ListOptions{})
+		if err != nil {
+			continue
+		}
+		for _, is := range iss.Items {
+			for _, history := range is.Status.Tags {
+				for i := range history.Items {
+					oc.AdminREST().Images().Delete(history.Items[i].Image)
+				}
+			}
+			for _, tagRef := range is.Spec.Tags {
+				switch tagRef.From.Kind {
+				case "ImageStreamImage":
+					_, id, err := imageapi.ParseImageStreamImageName(tagRef.From.Name)
+					if err != nil {
+						continue
+					}
+					oc.AdminREST().Images().Delete(id)
+				}
+			}
+			oc.AdminREST().ImageStreams(is.Namespace).Delete(is.Name)
+		}
+
+		// let the extended framework take care of the current namespace
+		if projectName != oc.Namespace() {
+			g.By(fmt.Sprintf("Deleting project %q", projectName))
+			oc.AdminREST().Projects().Delete(projectName)
+		}
+	}
+}
+
+// forceQuotaSync modifies some unrelated resource hard limit in resource quota object in order to force quota
+// usage resync.
+func forceQuotaResync(oc *exutil.CLI) error {
+	const syncAnnotation = "test.sync.counter"
+	hard := kapi.ResourceList{}
+	err := kclient.RetryOnConflict(kclient.DefaultRetry, func() error {
+		rq, err := oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Get(quotaName)
+		if err != nil {
+			return err
+		}
+		quantity, ok := rq.Spec.Hard[kapi.ResourceQuotas]
+		if !ok {
+			quantity = *resource.NewQuantity(0, resource.DecimalSI)
+		}
+		quantity.Set(quantity.Value() + 1)
+		rq.Spec.Hard[kapi.ResourceQuotas] = quantity
+		_, err = oc.AdminKubeREST().ResourceQuotas(oc.Namespace()).Update(rq)
+		hard = rq.Spec.Hard
+		return err
+	})
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
-	data := make([]byte, size)
-	if _, err = cryptorand.Read(data); err != nil {
-		return err
-	}
-
-	for i := range data {
-		data[i] = letters[uint(data[i])%uint(len(letters))]
-	}
-
-	f.Write(data)
-	return nil
+	return waitForLimitSync(oc, hard)
 }

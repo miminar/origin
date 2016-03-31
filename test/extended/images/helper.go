@@ -1,7 +1,14 @@
 package images
 
 import (
+	cryptorand "crypto/rand"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"os"
+	"path"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -10,6 +17,17 @@ import (
 	"github.com/openshift/origin/pkg/client"
 	"github.com/openshift/origin/pkg/image/api"
 	exutil "github.com/openshift/origin/test/extended/util"
+	testutil "github.com/openshift/origin/test/util"
+)
+
+const (
+	// There are coefficients used to multiply layer data size to get a rough size of uploaded blob.
+	layerSizeMultiplierForDocker18     = 2.0
+	layerSizeMultiplierForLatestDocker = 0.8
+)
+
+var (
+	reExpectedDeniedError *regexp.Regexp = regexp.MustCompile(`(?i)Failed to push image:.*requested access to the resource is denied`)
 )
 
 // GetImageLabels retrieves Docker labels from image from image repository name and
@@ -56,4 +74,149 @@ func CheckPageContains(oc *exutil.CLI, endpoint, path, contents string) (bool, e
 		return false, err
 	}
 	return strings.Contains(response, contents), nil
+}
+
+// BuildAndPushImageOfSize tries to build an image of wanted size and number of layers. Built image is stored
+// as an image stream tag <name>:<tag>. If shouldSucceed is false, a build is expected to fail with a denied
+// error. Note the size is only approximate. Resulting image size will be different depending on used
+// compression algorithm and metadata overhead.
+func BuildAndPushImageOfSize(
+	oc *exutil.CLI,
+	namespace, name, tag string,
+	size uint64,
+	numberOfLayers int,
+	shouldSucceed bool,
+) error {
+	istName := name
+	if tag != "" {
+		istName += ":" + tag
+	}
+
+	bc, err := oc.REST().BuildConfigs(namespace).Get(name)
+	if err == nil {
+		if bc.Spec.BuildSpec.Output.To.Kind != "ImageStreamTag" {
+			return fmt.Errorf("Unexpected kind of buildspec's output (%s != %s)", bc.Spec.BuildSpec.Output.To.Kind, "ImageStreamTag")
+		}
+		bc.Spec.BuildSpec.Output.To.Name = istName
+		if _, err = oc.REST().BuildConfigs(namespace).Update(bc); err != nil {
+			return err
+		}
+	} else {
+		if err = oc.Run("new-build").Args("--binary", "--name", name, "--to", istName).Execute(); err != nil {
+			return err
+		}
+	}
+
+	tempDir, err := ioutil.TempDir("", "name-build")
+	if err != nil {
+		return err
+	}
+
+	dataSize := calculateRoughDataSize(oc.Stdout(), size, numberOfLayers)
+
+	lines := make([]string, numberOfLayers+1)
+	lines[0] = "FROM scratch"
+	for i := 1; i <= numberOfLayers; i++ {
+		blobName := fmt.Sprintf("data%d", i)
+		if err = createRandomBlob(path.Join(tempDir, blobName), dataSize); err != nil {
+			return err
+		}
+		lines[i] = fmt.Sprintf("COPY %s /%s", blobName, blobName)
+	}
+	if err = ioutil.WriteFile(path.Join(tempDir, "Dockerfile"), []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+		return err
+	}
+
+	err = oc.Run("start-build").Args(name, "--from-dir", tempDir, "--wait").Execute()
+	if shouldSucceed && err != nil {
+		return fmt.Errorf("Got unexpected build error: %v", err)
+	}
+	if !shouldSucceed {
+		if err == nil {
+			return fmt.Errorf("Build unexpectedly succeeded")
+		}
+		out, err := oc.Run("logs").Args("bc/" + name).Output()
+		if err != nil {
+			return fmt.Errorf("Failed to show log of build config %s: %v", name, err)
+		}
+		if !reExpectedDeniedError.MatchString(out) {
+			return fmt.Errorf("Failed to match expected %q in: %q", reExpectedDeniedError.String(), out)
+		}
+	}
+
+	return nil
+}
+
+// createRandomBlob creates a random data with bytes from `letters` in order to let docker take advantage of
+// compression. Resulting layer size will be different due to file metadata overhead and compression.
+func createRandomBlob(dest string, size uint64) error {
+	var letters = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+	f, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	data := make([]byte, size)
+	if _, err = cryptorand.Read(data); err != nil {
+		return err
+	}
+
+	for i := range data {
+		data[i] = letters[uint(data[i])%uint(len(letters))]
+	}
+
+	f.Write(data)
+	return nil
+}
+
+// dockerVersion is a cached version string of Docker daemon
+var dockerVersion = ""
+
+// getDockerVersion returns a version of running Docker daemon which is questioned only during the first
+// invocation.
+func getDockerVersion(logger io.Writer) (major, minor int, version string, err error) {
+	reVersion := regexp.MustCompile(`^(\d+)\.(\d+)`)
+
+	if dockerVersion == "" {
+		client, err2 := testutil.NewDockerClient()
+		if err = err2; err != nil {
+			return
+		}
+		env, err2 := client.Version()
+		if err = err2; err != nil {
+			return
+		}
+		dockerVersion = env.Get("Version")
+		if logger != nil {
+			logger.Write([]byte(fmt.Sprintf("Using docker version %s\n", version)))
+		}
+	}
+	version = dockerVersion
+
+	matches := reVersion.FindStringSubmatch(version)
+	if len(matches) < 3 {
+		return 0, 0, "", fmt.Errorf("failed to parse version string %s", version)
+	}
+	major, _ = strconv.Atoi(matches[1])
+	minor, _ = strconv.Atoi(matches[2])
+	return
+}
+
+// calculateRoughDataSize returns a rough size of data blob to generate in order to build an image of wanted
+// size. Image is comprised of numberOfLayers layers of the same size.
+func calculateRoughDataSize(logger io.Writer, wantedImageSize uint64, numberOfLayers int) uint64 {
+	major, minor, version, err := getDockerVersion(logger)
+	if err != nil {
+		// TODO(miminar): shall we use some better logging mechanism?
+		logger.Write([]byte(fmt.Sprintf("Failed to get docker version: %v\n", err)))
+	}
+	if (major >= 1 && minor >= 9) || version == "" {
+		// running Docker version 1.9+
+		return uint64(float64(wantedImageSize) / (float64(numberOfLayers) * layerSizeMultiplierForLatestDocker))
+	}
+
+	// running Docker daemon < 1.9
+	return uint64(float64(wantedImageSize) / (float64(numberOfLayers) * layerSizeMultiplierForDocker18))
 }
