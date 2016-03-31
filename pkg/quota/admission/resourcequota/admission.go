@@ -1,7 +1,7 @@
 // This plugin supplements upstream ResourceQuota admission plugin.
 // It takes care of OpenShift specific resources that may be abusing resource quota limits.
 
-package admission
+package resourcequota
 
 import (
 	"fmt"

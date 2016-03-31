@@ -35,15 +35,17 @@ func NewImageQuotaRegistry(osClient osclient.Interface) quota.Registry {
 // images in internal registry. Returned registry is supposed to be used with origin resource quota admission
 // plugin. It evaluates image streams, image stream mappings and image stream tags. It cannot be passed to
 // resource quota controller because contained evaluators return just usage increments.
-func NewImageQuotaRegistryForAdmission(osClient osclient.Interface) quota.Registry {
+func NewImageQuotaRegistryForAdmission(osClient osclient.Interface, maximumTagsPerRepo int) quota.Registry {
 	imageStream := NewImageStreamAdmissionEvaluator(osClient)
 	imageStreamMapping := NewImageStreamMappingEvaluator(osClient)
 	imageStreamTag := NewImageStreamTagEvaluator(osClient)
+	imageStreamImport := NewImageStreamImportEvaluator(osClient, maximumTagsPerRepo)
 	return &generic.GenericRegistry{
 		InternalEvaluators: map[unversioned.GroupKind]quota.Evaluator{
 			imageStream.GroupKind():        imageStream,
 			imageStreamMapping.GroupKind(): imageStreamMapping,
 			imageStreamTag.GroupKind():     imageStreamTag,
+			imageStreamImport.GroupKind():  imageStreamImport,
 		},
 	}
 }

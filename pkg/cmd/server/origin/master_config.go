@@ -183,7 +183,9 @@ func BuildMasterConfig(options configapi.MasterConfig) (*MasterConfig, error) {
 		admissionControlPluginNames = options.AdmissionConfig.PluginOrderOverride
 	}
 
-	quotaRegistry := quota.NewOriginQuotaRegistry(privilegedLoopbackOpenShiftClient, true)
+	quotaRegistry := quota.NewOriginQuotaRegistryForAdmission(
+		privilegedLoopbackOpenShiftClient,
+		options.ImagePolicyConfig.MaxImagesBulkImportedPerRepository)
 	authorizer := newAuthorizer(policyClient, options.ProjectConfig.ProjectRequestMessage)
 
 	pluginInitializer := oadmission.PluginInitializer{
