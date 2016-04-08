@@ -52,34 +52,76 @@ const (
 	defaultProjectCacheTTL = time.Minute
 )
 
-// newQuotaEnforcingCaches creates caches for quota objects. The objects are stored with given eviction
-// timeout. Caches will only be initialized if the given ttl is positive.
-func newQuotaEnforcingCaches(projectCacheTTL string) *quotaEnforcingCaches {
-	ttl := defaultProjectCacheTTL
-	if len(projectCacheTTL) > 0 {
-		parsed, err := time.ParseDuration(projectCacheTTL)
-		if err != nil {
-			logrus.Errorf("Failed to parse %s=%q: %v", ProjectCacheTTLEnvVar, projectCacheTTL, err)
-		} else {
-			ttl = parsed
+// newQuotaEnforcingConfig creates caches for quota objects. The objects are stored with given eviction
+// timeout. Caches will only be initialized if the given ttl is positive. Options are gathered from
+// configuration file and will be overriden by enforceQuota and projectCacheTTL environment variable values.
+func newQuotaEnforcingConfig(ctx context.Context, enforceQuota, projectCacheTTL string, options map[string]interface{}) *quotaEnforcingConfig {
+	buildOptionValues := func(optionName string, override string) []string {
+		optValues := []string{}
+		if value, ok := options[optionName]; ok {
+			var res string
+			switch v := value.(type) {
+			case string:
+				res = v
+			case bool:
+				res = fmt.Sprintf("%t", v)
+			default:
+				res = fmt.Sprintf("%v", v)
+			}
+			optValues = append(optValues, res)
+		}
+		optValues = append(optValues, override)
+		return optValues
+	}
+
+	enforce := false
+	for _, s := range buildOptionValues("enforcequota", enforceQuota) {
+		if len(s) != 0 {
+			enforce = s == "true"
+		}
+	}
+	if !enforce {
+		context.GetLogger(ctx).Info("quota enforcement disabled")
+		return &quotaEnforcingConfig{
+			enforcementDisabled:  true,
+			projectCacheDisabled: true,
 		}
 	}
 
-	if ttl <= 0 {
-		logrus.Debug("Not using project caches for quota objects.")
-		return &quotaEnforcingCaches{}
+	ttl := defaultProjectCacheTTL
+	for _, s := range buildOptionValues("projectcachettl", projectCacheTTL) {
+		if len(s) == 0 {
+			continue
+		}
+		parsed, err := time.ParseDuration(s)
+		if err != nil {
+			logrus.Errorf("failed to parse project cache ttl %q: %v", s, err)
+			continue
+		}
+		ttl = parsed
 	}
 
-	logrus.Debugf("Caching project quota objects with TTL %s", ttl.String())
-	return &quotaEnforcingCaches{
+	if ttl <= 0 {
+		context.GetLogger(ctx).Info("not using project caches for quota objects")
+		return &quotaEnforcingConfig{
+			projectCacheDisabled: true,
+		}
+	}
+
+	context.GetLogger(ctx).Infof("caching project quota objects with TTL %s", ttl.String())
+	return &quotaEnforcingConfig{
 		resourceQuotas: newProjectObjectListCache(ttl),
 		limitRanges:    newProjectObjectListCache(ttl),
 	}
 }
 
-// quotaEnforcingCaches holds caches of object lists keyed by project name. Caches are thread safe and shall
-// be reused by all middleware layers.
-type quotaEnforcingCaches struct {
+// quotaEnforcingConfig holds configuration and caches of object lists keyed by project name. Caches are
+// thread safe and shall be reused by all middleware layers.
+type quotaEnforcingConfig struct {
+	// if set, disables quota enforcement
+	enforcementDisabled bool
+	// if set, disables use of caching of quota objects per project
+	projectCacheDisabled bool
 	// A cache of resource quota objects keyed by project name.
 	resourceQuotas projectObjectListStore
 	// A cache of limit range objects keyed by project name.
@@ -175,32 +217,32 @@ func admitLimitRanges(ctx context.Context, repo *repository, size int64) error {
 		err error
 	)
 
-	if quotaEnforcing.limitRanges != nil {
+	if !quotaEnforcing.projectCacheDisabled {
 		obj, exists, _ := quotaEnforcing.limitRanges.get(repo.namespace)
 		if exists {
 			lrs = obj.(*kapi.LimitRangeList)
 		}
 	}
 	if lrs == nil {
-		context.GetLogger(ctx).Debugf("Listing limit ranges in namespace %s", repo.namespace)
+		context.GetLogger(ctx).Debugf("listing limit ranges in namespace %s", repo.namespace)
 		lrs, err = repo.limitClient.LimitRanges(repo.namespace).List(kapi.ListOptions{})
 		if err != nil {
-			context.GetLogger(ctx).Errorf("Failed to list limitranges: %v", err)
+			context.GetLogger(ctx).Errorf("failed to list limitranges: %v", err)
 			return err
 		}
-		if quotaEnforcing.limitRanges != nil {
+		if !quotaEnforcing.projectCacheDisabled {
 			err = quotaEnforcing.limitRanges.add(repo.namespace, lrs)
 			if err != nil {
-				context.GetLogger(ctx).Errorf("Failed to cache limit range list: %v", err)
+				context.GetLogger(ctx).Errorf("failed to cache limit range list: %v", err)
 			}
 		}
 	}
 
 	for _, limitrange := range lrs.Items {
-		context.GetLogger(ctx).Debugf("Processing limit range %s/%s", limitrange.Namespace, limitrange.Name)
+		context.GetLogger(ctx).Debugf("processing limit range %s/%s", limitrange.Namespace, limitrange.Name)
 		for _, limit := range limitrange.Spec.Limits {
 			if err := imageadmission.AdmitImage(size, limit); err != nil {
-				context.GetLogger(ctx).Errorf("Refusing to write blob exceeding limit range: %s", err.Error())
+				context.GetLogger(ctx).Errorf("refusing to write blob exceeding limit range: %s", err.Error())
 				return distribution.ErrAccessDenied
 			}
 		}
@@ -216,23 +258,23 @@ func admitQuotas(ctx context.Context, repo *repository) error {
 		err error
 	)
 
-	if quotaEnforcing.resourceQuotas != nil {
+	if !quotaEnforcing.projectCacheDisabled {
 		obj, exists, _ := quotaEnforcing.resourceQuotas.get(repo.namespace)
 		if exists {
 			rqs = obj.(*kapi.ResourceQuotaList)
 		}
 	}
 	if rqs == nil {
-		context.GetLogger(ctx).Debugf("Listing resource quotas in namespace %s", repo.namespace)
+		context.GetLogger(ctx).Debugf("listing resource quotas in namespace %s", repo.namespace)
 		rqs, err = repo.quotaClient.ResourceQuotas(repo.namespace).List(kapi.ListOptions{})
 		if err != nil {
-			context.GetLogger(ctx).Errorf("Failed to list resourcequotas: %v", err)
+			context.GetLogger(ctx).Errorf("failed to list resourcequotas: %v", err)
 			return err
 		}
-		if quotaEnforcing.resourceQuotas != nil {
+		if !quotaEnforcing.projectCacheDisabled {
 			err = quotaEnforcing.resourceQuotas.add(repo.namespace, rqs)
 			if err != nil {
-				context.GetLogger(ctx).Errorf("Failed to cache resource quota list: %v", err)
+				context.GetLogger(ctx).Errorf("failed to cache resource quota list: %v", err)
 			}
 		}
 	}
@@ -246,7 +288,7 @@ func admitQuotas(ctx context.Context, repo *repository) error {
 	resources := quota.ResourceNames(usage)
 
 	for _, rq := range rqs.Items {
-		context.GetLogger(ctx).Debugf("Processing resource quota %s/%s", rq.Namespace, rq.Name)
+		context.GetLogger(ctx).Debugf("processing resource quota %s/%s", rq.Namespace, rq.Name)
 		newUsage := quota.Add(usage, rq.Status.Used)
 		newUsage = quota.Mask(newUsage, resources)
 		requested := quota.Mask(rq.Spec.Hard, resources)
@@ -258,7 +300,7 @@ func admitQuotas(ctx context.Context, repo *repository) error {
 			for i, r := range exceeded {
 				details[i] = fmt.Sprintf("%s limited to %s by %s", r, requested[r], by[r])
 			}
-			context.GetLogger(ctx).Error("Refusing to write blob exceeding quota: " + strings.Join(details, ", "))
+			context.GetLogger(ctx).Error("refusing to write blob exceeding quota: " + strings.Join(details, ", "))
 			return distribution.ErrAccessDenied
 		}
 	}

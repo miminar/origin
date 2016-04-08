@@ -2,7 +2,6 @@ package server
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -54,7 +53,7 @@ var (
 	insecureTransport http.RoundTripper
 	// quotaEnforcing contains shared caches of quota objects keyed by project name. Will be initialized
 	// only if the quota is enforced. See EnforceQuotaEnvVar.
-	quotaEnforcing *quotaEnforcingCaches
+	quotaEnforcing *quotaEnforcingConfig
 )
 
 func init() {
@@ -72,6 +71,9 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
+			if quotaEnforcing == nil {
+				quotaEnforcing = newQuotaEnforcingConfig(ctx, os.Getenv(EnforceQuotaEnvVar), os.Getenv(ProjectCacheTTLEnvVar), options)
+			}
 			return newRepositoryWithClient(registryOSClient, kClient, kClient, ctx, repo, options)
 		},
 	)
@@ -81,11 +83,6 @@ func init() {
 	if err != nil {
 		panic(fmt.Sprintf("Unable to configure a default transport for importing insecure images: %v", err))
 	}
-
-	if os.Getenv(EnforceQuotaEnvVar) == "true" {
-		quotaEnforcing = newQuotaEnforcingCaches(os.Getenv(ProjectCacheTTLEnvVar))
-	}
-
 }
 
 // repository wraps a distribution.Repository and allows manifests to be served from the OpenShift image
@@ -121,9 +118,9 @@ func newRepositoryWithClient(
 	repo distribution.Repository,
 	options map[string]interface{},
 ) (distribution.Repository, error) {
-	registryAddr := os.Getenv("DOCKER_REGISTRY_URL")
+	registryAddr := os.Getenv(DockerRegistryURLEnvVar)
 	if len(registryAddr) == 0 {
-		return nil, errors.New("DOCKER_REGISTRY_URL is required")
+		return nil, fmt.Errorf("%s is required", DockerRegistryURLEnvVar)
 	}
 
 	pullthrough := false
@@ -227,13 +224,13 @@ func (r *repository) ExistsByTag(tag string) (bool, error) {
 // Get retrieves the manifest with digest `dgst`.
 func (r *repository) Get(dgst digest.Digest) (*schema1.SignedManifest, error) {
 	if _, err := r.getImageStreamImage(dgst); err != nil {
-		context.GetLogger(r.ctx).Errorf("Error retrieving ImageStreamImage %s/%s@%s: %v", r.namespace, r.name, dgst.String(), err)
+		context.GetLogger(r.ctx).Errorf("error retrieving ImageStreamImage %s/%s@%s: %v", r.namespace, r.name, dgst.String(), err)
 		return nil, err
 	}
 
 	image, err := r.getImage(dgst)
 	if err != nil {
-		context.GetLogger(r.ctx).Errorf("Error retrieving image %s: %v", dgst.String(), err)
+		context.GetLogger(r.ctx).Errorf("error retrieving image %s: %v", dgst.String(), err)
 		return nil, err
 	}
 
@@ -258,7 +255,7 @@ func (r *repository) GetByTag(tag string, options ...distribution.ManifestServic
 	imageStreamTag, err := r.getImageStreamTag(tag)
 	if err != nil {
 		// TODO: typed errors
-		context.GetLogger(r.ctx).Errorf("Error getting ImageStreamTag %q: %v", tag, err)
+		context.GetLogger(r.ctx).Errorf("error getting ImageStreamTag %q: %v", tag, err)
 		return nil, err
 	}
 	image := &imageStreamTag.Image
@@ -279,14 +276,14 @@ func (r *repository) GetByTag(tag string, options ...distribution.ManifestServic
 
 	dgst, err := digest.ParseDigest(imageStreamTag.Image.Name)
 	if err != nil {
-		context.GetLogger(r.ctx).Errorf("Error parsing digest %q: %v", imageStreamTag.Image.Name, err)
+		context.GetLogger(r.ctx).Errorf("error parsing digest %q: %v", imageStreamTag.Image.Name, err)
 		return nil, err
 	}
 
 	if localImage, err := r.getImage(dgst); err != nil {
 		// if the image is managed by OpenShift and we cannot load the image, report an error
 		if image.Annotations[imageapi.ManagedByOpenShiftAnnotation] == "true" {
-			context.GetLogger(r.ctx).Errorf("Error getting image %q: %v", dgst.String(), err)
+			context.GetLogger(r.ctx).Errorf("error getting image %q: %v", dgst.String(), err)
 			return nil, err
 		}
 	} else {
@@ -303,7 +300,7 @@ func (r *repository) GetByTag(tag string, options ...distribution.ManifestServic
 
 	// check the previous error here
 	if referenceErr != nil {
-		context.GetLogger(r.ctx).Errorf("Error parsing image %q: %v", image.DockerImageReference, referenceErr)
+		context.GetLogger(r.ctx).Errorf("error parsing image %q: %v", image.DockerImageReference, referenceErr)
 		return nil, referenceErr
 	}
 
@@ -318,14 +315,14 @@ func (r *repository) pullthroughGetByTag(image *imageapi.Image, ref imageapi.Doc
 
 	repo, err := retriever.Repository(r.ctx, defaultRef.RegistryURL(), defaultRef.RepositoryName(), false)
 	if err != nil {
-		context.GetLogger(r.ctx).Errorf("Error getting remote repository for image %q: %v", image.DockerImageReference, err)
+		context.GetLogger(r.ctx).Errorf("error getting remote repository for image %q: %v", image.DockerImageReference, err)
 		return nil, err
 	}
 
 	// get a manifest context
 	manifests, err := repo.Manifests(r.ctx)
 	if err != nil {
-		context.GetLogger(r.ctx).Errorf("Error getting manifests for image %q: %v", image.DockerImageReference, err)
+		context.GetLogger(r.ctx).Errorf("error getting manifests for image %q: %v", image.DockerImageReference, err)
 		return nil, err
 	}
 
@@ -333,12 +330,12 @@ func (r *repository) pullthroughGetByTag(image *imageapi.Image, ref imageapi.Doc
 	if len(ref.ID) > 0 {
 		dgst, err := digest.ParseDigest(ref.ID)
 		if err != nil {
-			context.GetLogger(r.ctx).Errorf("Error getting manifests for image %q: %v", image.DockerImageReference, err)
+			context.GetLogger(r.ctx).Errorf("error getting manifests for image %q: %v", image.DockerImageReference, err)
 			return nil, err
 		}
 		manifest, err := manifests.Get(dgst)
 		if err != nil {
-			context.GetLogger(r.ctx).Errorf("Error getting manifest from remote server for image %q: %v", image.DockerImageReference, err)
+			context.GetLogger(r.ctx).Errorf("error getting manifest from remote server for image %q: %v", image.DockerImageReference, err)
 			return nil, err
 		}
 		r.rememberLayers(manifest, cacheName)
@@ -348,7 +345,7 @@ func (r *repository) pullthroughGetByTag(image *imageapi.Image, ref imageapi.Doc
 	// fetch this by tag
 	manifest, err := manifests.GetByTag(ref.Tag, options...)
 	if err != nil {
-		context.GetLogger(r.ctx).Errorf("Error getting manifest from remote server for image %q: %v", image.DockerImageReference, err)
+		context.GetLogger(r.ctx).Errorf("error getting manifest from remote server for image %q: %v", image.DockerImageReference, err)
 		return nil, err
 	}
 
@@ -397,18 +394,18 @@ func (r *repository) Put(manifest *schema1.SignedManifest) error {
 		// if the error was that the image stream wasn't found, try to auto provision it
 		statusErr, ok := err.(*kerrors.StatusError)
 		if !ok {
-			context.GetLogger(r.ctx).Errorf("Error creating ImageStreamMapping: %s", err)
+			context.GetLogger(r.ctx).Errorf("error creating ImageStreamMapping: %s", err)
 			return err
 		}
 
 		if kerrors.IsForbidden(statusErr) {
-			context.GetLogger(r.ctx).Errorf("Denied creating ImageStreamMapping: %v", statusErr)
+			context.GetLogger(r.ctx).Errorf("denied creating ImageStreamMapping: %v", statusErr)
 			return distribution.ErrAccessDenied
 		}
 
 		status := statusErr.ErrStatus
 		if status.Code != http.StatusNotFound || (strings.ToLower(status.Details.Kind) != "imagestream" /*pre-1.2*/ && strings.ToLower(status.Details.Kind) != "imagestreams") || status.Details.Name != r.name {
-			context.GetLogger(r.ctx).Errorf("Error creating ImageStreamMapping: %s", err)
+			context.GetLogger(r.ctx).Errorf("error creating ImageStreamMapping: %s", err)
 			return err
 		}
 
@@ -420,18 +417,26 @@ func (r *repository) Put(manifest *schema1.SignedManifest) error {
 
 		client, ok := UserClientFrom(r.ctx)
 		if !ok {
-			context.GetLogger(r.ctx).Errorf("Error creating user client to auto provision image stream: Origin user client unavailable")
+			context.GetLogger(r.ctx).Errorf("error creating user client to auto provision image stream: Origin user client unavailable")
 			return statusErr
 		}
 
 		if _, err := client.ImageStreams(r.namespace).Create(&stream); err != nil {
-			context.GetLogger(r.ctx).Errorf("Error auto provisioning image stream: %s", err)
+			if kerrors.IsForbidden(err) {
+				context.GetLogger(r.ctx).Errorf("denied a creation of ImageStream: %v", err)
+				return distribution.ErrAccessDenied
+			}
+			context.GetLogger(r.ctx).Errorf("error auto provisioning image stream: %s", err)
 			return statusErr
 		}
 
 		// try to create the ISM again
 		if err := r.registryOSClient.ImageStreamMappings(r.namespace).Create(&ism); err != nil {
-			context.GetLogger(r.ctx).Errorf("Error creating image stream mapping: %s", err)
+			if kerrors.IsForbidden(err) {
+				context.GetLogger(r.ctx).Errorf("denied a creation of ImageStreamMapping: %v", err)
+				return distribution.ErrAccessDenied
+			}
+			context.GetLogger(r.ctx).Errorf("error creating ImageStreamMapping: %s", err)
 			return err
 		}
 	}
@@ -444,7 +449,7 @@ func (r *repository) Put(manifest *schema1.SignedManifest) error {
 
 	for _, signature := range signatures {
 		if err := r.Signatures().Put(dgst, signature); err != nil {
-			context.GetLogger(r.ctx).Errorf("Error storing signature: %s", err)
+			context.GetLogger(r.ctx).Errorf("error storing signature: %s", err)
 			return err
 		}
 	}
@@ -469,7 +474,7 @@ func (r *repository) fillImageWithMetadata(manifest *schema1.SignedManifest, ima
 		// DockerImageLayers represents manifest.Manifest.FSLayers in reversed order
 		desc, err := blobs.Stat(r.ctx, manifest.Manifest.FSLayers[len(image.DockerImageLayers)-i-1].BlobSum)
 		if err != nil {
-			context.GetLogger(r.ctx).Errorf("Failed to stat blobs %s of image %s", layer.Name, image.DockerImageReference)
+			context.GetLogger(r.ctx).Errorf("failed to stat blobs %s of image %s", layer.Name, image.DockerImageReference)
 			return err
 		}
 		layer.Size = desc.Size
@@ -481,7 +486,7 @@ func (r *repository) fillImageWithMetadata(manifest *schema1.SignedManifest, ima
 	}
 
 	image.DockerImageMetadata.Size = size
-	context.GetLogger(r.ctx).Infof("Total size of image %s with docker ref %s: %d", image.Name, image.DockerImageReference, size)
+	context.GetLogger(r.ctx).Infof("total size of image %s with docker ref %s: %d", image.Name, image.DockerImageReference, size)
 
 	return nil
 }
@@ -502,7 +507,7 @@ func (r *repository) Delete(dgst digest.Digest) error {
 func (r *repository) importContext() importer.RepositoryRetriever {
 	secrets, err := r.registryOSClient.ImageStreamSecrets(r.namespace).Secrets(r.name, kapi.ListOptions{})
 	if err != nil {
-		context.GetLogger(r.ctx).Errorf("Error getting secrets for repository %q: %v", r.Name(), err)
+		context.GetLogger(r.ctx).Errorf("error getting secrets for repository %q: %v", r.Name(), err)
 		secrets = &kapi.SecretList{}
 	}
 	credentials := importer.NewCredentialsForSecrets(secrets.Items)
