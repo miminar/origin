@@ -26,6 +26,17 @@ import (
 	"github.com/openshift/origin/pkg/image/importer"
 )
 
+const (
+	// DockerRegistryURLEnvVar is a mandatory environment variable name specifying external url of internal
+	// docker registry. All references to pushed images will be prefixed with its value.
+	DockerRegistryURLEnvVar = "DOCKER_REGISTRY_URL"
+
+	// EnforceQuotaEnvVar is a boolean environment variable that allows to turn quota enforcement on or off.
+	// By default, quota enforcement is off. It overrides openshift middleware configuration option.
+	// Recognized values are "true" and "false".
+	EnforceQuotaEnvVar = "REGISTRY_MIDDLEWARE_REPOSITORY_OPENSHIFT_ENFORCEQUOTA"
+)
+
 var (
 	// cachedLayers is a shared cache of blob digests to remote repositories that have previously
 	// been identified as containing that blob. Thread safe and reused by all middleware layers.
@@ -49,11 +60,11 @@ func init() {
 	// DefaultRegistryClient before starting a registry.
 	repomw.Register("openshift",
 		func(ctx context.Context, repo distribution.Repository, options map[string]interface{}) (distribution.Repository, error) {
-			registryClient, kClient, err := DefaultRegistryClient.Clients()
+			registryOSClient, kClient, err := DefaultRegistryClient.Clients()
 			if err != nil {
 				return nil, err
 			}
-			return newRepositoryWithClient(registryClient, kClient, kClient, ctx, repo, options)
+			return newRepositoryWithClient(registryOSClient, kClient, kClient, ctx, repo, options)
 		},
 	)
 
@@ -69,14 +80,17 @@ func init() {
 type repository struct {
 	distribution.Repository
 
-	ctx            context.Context
-	quotaClient    kclient.ResourceQuotasNamespacer
-	limitClient    kclient.LimitRangesNamespacer
-	registryClient client.Interface
-	registryAddr   string
-	namespace      string
-	name           string
+	ctx              context.Context
+	quotaClient      kclient.ResourceQuotasNamespacer
+	limitClient      kclient.LimitRangesNamespacer
+	registryOSClient client.Interface
+	registryAddr     string
+	namespace        string
+	name             string
 
+	// if true, a blob write will fail when the quota is being exceeded or the quota cannot be fetched from
+	// origin server
+	enforceQuota bool
 	// if true, the repository will check remote references in the image stream to support pulling "through"
 	// from a remote repository
 	pullthrough bool
@@ -89,11 +103,20 @@ type repository struct {
 var _ distribution.ManifestService = &repository{}
 
 // newRepositoryWithClient returns a new repository middleware.
-func newRepositoryWithClient(registryClient client.Interface, quotaClient kclient.ResourceQuotasNamespacer, limitClient kclient.LimitRangesNamespacer, ctx context.Context, repo distribution.Repository, options map[string]interface{}) (distribution.Repository, error) {
+func newRepositoryWithClient(
+	registryOSClient client.Interface,
+	quotaClient kclient.ResourceQuotasNamespacer,
+	limitClient kclient.LimitRangesNamespacer,
+	ctx context.Context,
+	repo distribution.Repository,
+	options map[string]interface{},
+) (distribution.Repository, error) {
 	registryAddr := os.Getenv("DOCKER_REGISTRY_URL")
 	if len(registryAddr) == 0 {
 		return nil, errors.New("DOCKER_REGISTRY_URL is required")
 	}
+
+	enforceQuota := os.Getenv(EnforceQuotaEnvVar) == "true"
 
 	pullthrough := false
 	if value, ok := options["pullthrough"]; ok {
@@ -110,15 +133,16 @@ func newRepositoryWithClient(registryClient client.Interface, quotaClient kclien
 	return &repository{
 		Repository: repo,
 
-		ctx:            ctx,
-		quotaClient:    quotaClient,
-		limitClient:    limitClient,
-		registryClient: registryClient,
-		registryAddr:   registryAddr,
-		namespace:      nameParts[0],
-		name:           nameParts[1],
-		pullthrough:    pullthrough,
-		cachedLayers:   cachedLayers,
+		ctx:              ctx,
+		quotaClient:      quotaClient,
+		limitClient:      limitClient,
+		registryOSClient: registryOSClient,
+		registryAddr:     registryAddr,
+		namespace:        nameParts[0],
+		name:             nameParts[1],
+		enforceQuota:     enforceQuota,
+		pullthrough:      pullthrough,
+		cachedLayers:     cachedLayers,
 	}, nil
 }
 
@@ -137,20 +161,27 @@ func (r *repository) Blobs(ctx context.Context) distribution.BlobStore {
 	repo := repository(*r)
 	repo.ctx = ctx
 
-	bs := &quotaRestrictedBlobStore{
-		BlobStore: r.Repository.Blobs(ctx),
-		repo:      &repo,
-	}
-	if !r.pullthrough {
-		return bs
+	bs := r.Repository.Blobs(ctx)
+
+	if r.enforceQuota {
+		bs = &quotaRestrictedBlobStore{
+			BlobStore: bs,
+
+			repo: &repo,
+		}
 	}
 
-	return &pullthroughBlobStore{
-		BlobStore: bs,
+	if r.pullthrough {
+		bs = &pullthroughBlobStore{
+			BlobStore: bs,
 
-		repo:          &repo,
-		digestToStore: make(map[string]distribution.BlobStore),
+			repo:          &repo,
+			digestToStore: make(map[string]distribution.BlobStore),
+		}
 	}
+
+	return bs
+
 }
 
 // Tags lists the tags under the named repository.
@@ -355,7 +386,7 @@ func (r *repository) Put(manifest *schema1.SignedManifest) error {
 		return err
 	}
 
-	if err := r.registryClient.ImageStreamMappings(r.namespace).Create(&ism); err != nil {
+	if err := r.registryOSClient.ImageStreamMappings(r.namespace).Create(&ism); err != nil {
 		// if the error was that the image stream wasn't found, try to auto provision it
 		statusErr, ok := err.(*kerrors.StatusError)
 		if !ok {
@@ -392,7 +423,7 @@ func (r *repository) Put(manifest *schema1.SignedManifest) error {
 		}
 
 		// try to create the ISM again
-		if err := r.registryClient.ImageStreamMappings(r.namespace).Create(&ism); err != nil {
+		if err := r.registryOSClient.ImageStreamMappings(r.namespace).Create(&ism); err != nil {
 			context.GetLogger(r.ctx).Errorf("Error creating image stream mapping: %s", err)
 			return err
 		}
@@ -462,7 +493,7 @@ func (r *repository) Delete(dgst digest.Digest) error {
 // importContext loads secrets for this image stream and returns a context for getting distribution
 // clients to remote repositories.
 func (r *repository) importContext() importer.RepositoryRetriever {
-	secrets, err := r.registryClient.ImageStreamSecrets(r.namespace).Secrets(r.name, kapi.ListOptions{})
+	secrets, err := r.registryOSClient.ImageStreamSecrets(r.namespace).Secrets(r.name, kapi.ListOptions{})
 	if err != nil {
 		context.GetLogger(r.ctx).Errorf("Error getting secrets for repository %q: %v", r.Name(), err)
 		secrets = &kapi.SecretList{}
@@ -473,24 +504,24 @@ func (r *repository) importContext() importer.RepositoryRetriever {
 
 // getImageStream retrieves the ImageStream for r.
 func (r *repository) getImageStream() (*imageapi.ImageStream, error) {
-	return r.registryClient.ImageStreams(r.namespace).Get(r.name)
+	return r.registryOSClient.ImageStreams(r.namespace).Get(r.name)
 }
 
 // getImage retrieves the Image with digest `dgst`.
 func (r *repository) getImage(dgst digest.Digest) (*imageapi.Image, error) {
-	return r.registryClient.Images().Get(dgst.String())
+	return r.registryOSClient.Images().Get(dgst.String())
 }
 
 // getImageStreamTag retrieves the Image with tag `tag` for the ImageStream
 // associated with r.
 func (r *repository) getImageStreamTag(tag string) (*imageapi.ImageStreamTag, error) {
-	return r.registryClient.ImageStreamTags(r.namespace).Get(r.name, tag)
+	return r.registryOSClient.ImageStreamTags(r.namespace).Get(r.name, tag)
 }
 
 // getImageStreamImage retrieves the Image with digest `dgst` for the ImageStream
 // associated with r. This ensures the image belongs to the image stream.
 func (r *repository) getImageStreamImage(dgst digest.Digest) (*imageapi.ImageStreamImage, error) {
-	return r.registryClient.ImageStreamImages(r.namespace).Get(r.name, dgst.String())
+	return r.registryOSClient.ImageStreamImages(r.namespace).Get(r.name, dgst.String())
 }
 
 // rememberLayers caches the provided layers
