@@ -88,8 +88,7 @@ func WriteKey(keyPath string, data []byte) error {
 // can't find one, it will generate a new key and store it there.
 func LoadOrGenerateKeyFile(keyPath string) (data []byte, wasGenerated bool, err error) {
 	loadedData, err := ioutil.ReadFile(keyPath)
-	// Call verifyKeyData to ensure the file wasn't empty/corrupt.
-	if err == nil && verifyKeyData(loadedData) {
+	if err == nil {
 		return loadedData, false, err
 	}
 	if !os.IsNotExist(err) {
@@ -181,13 +180,4 @@ func PublicKeysFromFile(file string) ([]interface{}, error) {
 		return nil, fmt.Errorf("error reading public key file %s: %v", file, err)
 	}
 	return keys, nil
-}
-
-// verifyKeyData returns true if the provided data appears to be a valid private key.
-func verifyKeyData(data []byte) bool {
-	if len(data) == 0 {
-		return false
-	}
-	_, err := ParsePrivateKeyPEM(data)
-	return err == nil
 }
