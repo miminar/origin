@@ -1919,6 +1919,7 @@ func expectBlockedOrJob(
 	}
 }
 
+/* TODO: reenable once event handling is enabled again
 func TestChangeImageStreamsWhilePruning(t *testing.T) {
 	flag.Lookup("v").Value.Set(fmt.Sprint(*logLevel))
 
@@ -2059,6 +2060,7 @@ func TestChangeImageStreamsWhilePruning(t *testing.T) {
 		t.Errorf("expected deletion %q did not happen", del)
 	}
 }
+*/
 
 func streamListToClient(list *imageapi.ImageStreamList) imageclient.ImageStreamsGetter {
 	streams := make([]runtime.Object, 0, len(list.Items))
